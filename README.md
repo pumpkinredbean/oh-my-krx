@@ -189,6 +189,10 @@ Compose 내부에서는 `BOOTSTRAP_SERVERS=redpanda:9092`를 사용합니다.
 
 - `docs/architecture/overview.md`
 
+## 라이선스
+
+이 프로젝트는 [MIT License](./LICENSE)로 배포됩니다.
+
 ## 기여 안내
 
 기여할 때는 현재 실제로 동작하는 범위와 아직 준비 중인 범위를 구분해서 봐주시면 좋습니다.
