@@ -9,6 +9,7 @@
 - `src/` holds the real implementation behind the thin app entrypoints.
 - `web_app.py` contains the real dashboard implementation.
 - `kis_websocket.py` contains the KIS integration and schema-heavy mapping logic.
+- `src/kis_websocket.py`: SUNSET shim, remove when KSXT program_trade StreamKind ships.
 - `config.py` is a compatibility re-export over `packages.shared.config`.
 
 ## Always
