@@ -89,3 +89,31 @@ impact so later sessions can branch with full context.
     crypto symbol seed 중 선택. (1) 을 1순위로 권장.
   - blocker 해소 세션 불필요. KXT/KRX 경로 회귀 없음.
   - `git push` 금지(H6) 는 H21 미해결 조건으로 그대로 유지.
+
+---
+
+## H25 — Multiprovider step 3: external identity normalisation, capability-driven event catalog, minimal admin UI 통합 결과
+
+- **질문**: multiprovider step 3 (외부 identity 정규화 + capability-driven event catalog + admin UI 최소 통합) 결과는?
+- **결정**: **PASS** — 외부 노출되는 provider 값이 `kxt | ccxt`로 제한되었고 `ccxt_pro`는 내부 transport detail로만 남았다. canonical_symbol은 `provider:venue:asset_class:instrument_type:display_symbol[:settle_asset][:expiry]` 형식으로 마이그레이션되었으며, raw exchange symbol은 `InstrumentRef.raw_symbol`로 분리되었다. event catalog는 `(provider, venue, asset_class, instrument_type)` 기반 capability matrix로 변경되었고, admin UI는 기존 Targets/Runtime/Events 안에서 KXT vs Binance spot/perpetual 구분 및 crypto target 생성을 지원한다.
+- **근거**:
+  - `packages/domain/enums.py`: `external_provider_value(provider)` boundary helper 추가 — `Provider.CCXT_PRO`/`"ccxt_pro"`를 `"ccxt"`로 collapse. `EXTERNAL_PROVIDER_VALUES = {"kxt","ccxt"}` 상수로 외부 surface 제한.
+  - `packages/domain/models.py`: `build_canonical_symbol`이 `asset_class`/`display_symbol`/`settle_asset`/`expiry` 인자를 받아 5+axis 형식 생성. `provider`는 항상 `external_provider_value()`로 정규화. `InstrumentRef.raw_symbol: str | None` 추가.
+  - `packages/contracts/events.py`: `EventType`에 `TICKER`/`OHLCV`/`MARK_PRICE`/`FUNDING_RATE`/`OPEN_INTEREST` 추가 (기존 3종 유지). `DashboardEventEnvelope`/`DashboardControlEnvelope`에 `instrument_type`/`raw_symbol` 추가.
+  - `packages/contracts/admin.py`: `SourceCapability` 신규 dataclass. `ControlPlaneSnapshot.source_capabilities` 추가. `RecentRuntimeEvent`에 `instrument_type`/`raw_symbol` 추가.
+  - `packages/adapters/registry.py`: 외부 노출 provider를 `{KXT, CCXT}`로 한정. `Provider.CCXT_PRO` 등록 제거 — `ccxt.pro`는 `BinanceLiveAdapter` 내부 transport.
+  - `packages/adapters/ccxt.py`: `CCXTAdapterStub`이 외부 CCXT 경계 (`adapter_id="ccxt"`, streaming via `BinanceLiveAdapter`). `CCXTProAdapterStub`은 legacy import 호환만.
+  - `src/collector_control_plane.py`: `SOURCE_CAPABILITIES` (KXT KRX equity → trade/orderbook/program_trade · Binance spot → trade/orderbook/ticker/ohlcv · Binance perpetual → 위 + mark_price/funding_rate/open_interest), `capability_for(...)` 헬퍼, `_normalize_event_types`가 capability 기반 reject ("event_types not supported by Binance Spot (CCXT): mark_price"). `_normalize_provider`/`_normalize_instrument_type`이 `ccxt_pro`→`ccxt`, KXT `EQUITY`→`SPOT` collapse. `_build_instrument_ref`가 새 5+axis canonical과 `raw_symbol` 생성. `record_runtime_event`/`upsert_target`/`search_instruments`가 raw_symbol/instrument_type/capability 인지.
+  - `apps/collector/runtime.py`: `_resolve_provider`/`_resolve_instrument_type` 외부 normalize. `register_target`/`_register_kxt_target`/`_register_crypto_target`이 `raw_symbol` 전달, `RuntimeTargetRegistration.raw_symbol` 추가. crypto canonical을 새 형식으로 빌드 (perpetual은 settle_asset 포함, display=BTC/USDT, raw=BTCUSDT 분리). `_publish_event`가 raw_symbol 전달, crypto consume이 `external_provider_value(provider)`로 publish — 외부에 ccxt_pro 누출 0건.
+  - `apps/collector/service.py`: `AdminTargetUpsertRequest`가 provider/instrument_type/raw_symbol 수용. `start_dashboard_publication`이 ccxt_pro→ccxt collapse. `_handle_runtime_event`가 envelope/control_plane 양쪽에 외부 정규화된 provider 전달. `/admin/instruments`에 provider/instrument_type query 파라미터 추가.
+  - `apps/collector/publisher.py`: `publish_dashboard_event`가 instrument_type/raw_symbol forward.
+  - `src/web_app.py`: `/api/admin/instruments` relay가 provider/instrument_type 수용, ccxt_pro 입력은 ccxt로 collapse, KRX scope regex를 optional로 완화.
+  - `apps/admin_web/src/App.tsx`: `SourceCapability` 타입과 source preset selector를 `snapshot.source_capabilities` 기반으로 추가 (KRX Equity (KXT) / Binance Spot (CCXT) / Binance USDT Perpetual (CCXT)). event-type checkbox가 capability-filtered. crypto 입력 시 `raw_symbol` 필드 노출, market_scope=""로 전송. Targets/Runtime/Events 모두 provider/instrument_type/canonical_symbol을 표면화.
+  - 신규 `tests/test_multiprovider_step3_identity.py`: canonical no-leak, raw_symbol field, capability matrix 검증, capability gating reject (program_trade on Binance · mark_price on Binance spot), capability allow (mark_price/funding_rate on perpetual), record_runtime_event 외부 정규화, registry no ccxt_pro. `tests/test_multiprovider_step1.py`/`step2_ccxt.py`는 새 canonical/외부 provider 값으로 갱신. step1+step2+step3+search 합산 31 passed.
+  - End-to-end 검증: `jsonable_encoder`로 직렬화한 snapshot 전체 JSON에 `"ccxt_pro"` 부재 확인. `DashboardEventEnvelope` 직렬화도 동일 확인. crypto target canonical은 `ccxt:binance:crypto:perpetual:BTC/USDT:USDT`, `provider`는 `ccxt`, `raw_symbol`은 `BTCUSDT`로 분리됨.
+  - `/Users/minkyu/workspace/kxt` 변경 0건 (제약 준수).
+- **영향**:
+  - `git push` 금지(H6) 는 H21 미해결 조건으로 그대로 유지.
+  - 다음 세션은 (1) 정규장 시간대 시나리오 1 재실행 (H21 unblock), (2) admin SPA bundle 재빌드 (`src/web/admin_dist/assets/index-*.js`는 step3 이전 UI를 인코딩한 stale 상태 — frontend 변경은 source-only), (3) kxt v0.1.0의 `Subscription` public export 추가 (apps.collector.runtime import 차단 해결) 중 선택 가능.
+  - 잔존 위험: KXT 내부 `instrument_type` 기본값을 `EQUITY`→`SPOT`으로 변경했으나 asset_class는 그대로 `EQUITY`. in-repo 다운스트림 소비자에 영향 없음.
+  - 본 결정 리포트는 권한 제한으로 vault에 직접 작성 불가 — repo-local `docs/adr/multiprovider-identity-ui-step3-report.md`에 기록되었으며 vault 측 mirror는 별도 운영자 작업으로 미룬다.

@@ -48,11 +48,12 @@ _SUPPORTED_INSTRUMENT_TYPES: tuple[InstrumentType, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class CCXTAdapterStub:
-    """Descriptor for the CCXT (REST) provider boundary.
+    """Descriptor for the externally exposed CCXT provider boundary.
 
-    Step 2 wires CCXT Pro for streaming.  CCXT REST itself remains
-    out-of-scope; the descriptor is kept so the registry can advertise the
-    REST axis even though no REST sync is implemented.
+    Step 3 collapses the CCXT and CCXT Pro descriptors into a single
+    ``CCXT`` provider.  ``ccxt.pro`` is kept as the internal transport
+    detail used by :class:`BinanceLiveAdapter`; it must not appear on
+    outward-facing contracts.
     """
 
     adapter_id: str = "ccxt"
@@ -60,7 +61,7 @@ class CCXTAdapterStub:
     default_venue: Venue = Venue.BINANCE
     implemented: bool = True
     supported_instrument_types: tuple[InstrumentType, ...] = _SUPPORTED_INSTRUMENT_TYPES
-    notes: str = "Streaming served via CCXT Pro adapter; REST sync deferred."
+    notes: str = "Streaming served by BinanceLiveAdapter; ccxt.pro is internal transport detail."
 
     def healthcheck(self) -> bool:
         return True
@@ -77,12 +78,11 @@ class CCXTAdapterStub:
 
 @dataclass(frozen=True, slots=True)
 class CCXTProAdapterStub:
-    """Descriptor for the CCXT Pro (WebSocket) provider boundary.
+    """Internal-only descriptor for the ccxt.pro transport.
 
-    Step 2: real live adapter is provided by :class:`BinanceLiveAdapter`.
-    The descriptor still exists so the provider registry has a
-    dependency-light entry that any caller can introspect without
-    importing ccxt.
+    Retained for backwards compatibility with step1/step2 imports.
+    Not registered in the public provider registry — the externally
+    exposed surface uses ``CCXTAdapterStub`` (provider=ccxt) only.
     """
 
     adapter_id: str = "ccxt_pro"
@@ -90,7 +90,9 @@ class CCXTProAdapterStub:
     default_venue: Venue = Venue.BINANCE
     implemented: bool = True
     supported_instrument_types: tuple[InstrumentType, ...] = _SUPPORTED_INSTRUMENT_TYPES
-    notes: str = "Live WebSocket via BinanceLiveAdapter (binance + binanceusdm)."
+    notes: str = (
+        "Internal transport detail behind Provider.CCXT — do not expose externally."
+    )
 
     def healthcheck(self) -> bool:
         return True

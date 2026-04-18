@@ -71,7 +71,7 @@ from apps.collector.runtime import CollectorRuntime, SUPPORTED_MARKET_SCOPES
 from packages.adapters import build_default_registry
 from packages.contracts.events import EventType
 from packages.contracts.topics import DASHBOARD_CONTROL_TOPIC
-from packages.domain.enums import Provider
+from packages.domain.enums import Provider, external_provider_value
 from packages.infrastructure.kafka import AsyncKafkaJsonBroker
 from packages.shared.config import load_service_settings
 from src.collector_control_plane import CollectorControlPlaneService
@@ -108,8 +108,15 @@ class AdminTargetUpsertRequest(BaseModel):
     enabled: bool = True
     market_scope: str | None = None
     market: str | None = None
+    provider: str | None = None
+    instrument_type: str | None = None
+    raw_symbol: str | None = None
 
     def resolved_market_scope(self) -> str:
+        provider_text = (self.provider or "").strip().lower()
+        # Crypto sources do not carry a KRX market_scope; allow empty.
+        if provider_text in {"ccxt", "ccxt_pro"}:
+            return (self.market_scope or self.market or "").strip().lower()
         return _resolve_market_scope(scope=self.market_scope, market=self.market)
 
 
@@ -180,10 +187,21 @@ class CollectorDashboardService:
         provider: str | Provider | None = None,
         instrument_type: str | None = None,
         canonical_symbol: str | None = None,
+        raw_symbol: str | None = None,
     ) -> dict[str, Any]:
-        resolved_provider = provider if isinstance(provider, Provider) else (
-            Provider(provider.strip().lower()) if isinstance(provider, str) and provider.strip() else Provider.KXT
-        )
+        # Normalise provider externally to {kxt, ccxt}; ccxt_pro is collapsed
+        # to ccxt at the service boundary so it never leaks downstream.
+        if isinstance(provider, Provider):
+            provider_text = external_provider_value(provider)
+        else:
+            provider_text = (provider or "").strip().lower() or "kxt"
+            if provider_text == "ccxt_pro":
+                provider_text = "ccxt"
+        try:
+            resolved_provider = Provider(provider_text)
+        except ValueError as exc:
+            raise ValueError(f"unsupported provider: {provider}") from exc
+
         resolved_market_scope = market_scope.strip().lower() if market_scope else ""
         if resolved_provider == Provider.KXT:
             subscription = self._build_subscription(symbol=symbol, market_scope=resolved_market_scope)
@@ -195,7 +213,7 @@ class CollectorDashboardService:
             if not symbol_value:
                 raise ValueError("symbol is required")
             scope_value = ""
-            subscription_key = f"dashboard:{resolved_provider.value}:{instrument_type or 'spot'}:{symbol_value}"
+            subscription_key = f"dashboard:{external_provider_value(resolved_provider)}:{instrument_type or 'spot'}:{symbol_value}"
 
         resolved_owner_id = owner_id or uuid.uuid4().hex
 
@@ -207,6 +225,7 @@ class CollectorDashboardService:
             provider=resolved_provider,
             canonical_symbol=canonical_symbol,
             instrument_type=instrument_type,
+            raw_symbol=raw_symbol,
         )
 
         async with self._lock:
@@ -217,9 +236,10 @@ class CollectorDashboardService:
             "symbol": symbol_value,
             "market_scope": scope_value,
             "market": scope_value,
-            "provider": resolved_provider.value,
+            "provider": external_provider_value(resolved_provider),
             "instrument_type": instrument_type,
             "canonical_symbol": canonical_symbol,
+            "raw_symbol": raw_symbol,
             "status": "started",
         }
 
@@ -250,9 +270,21 @@ class CollectorDashboardService:
         snapshot = await self._control_plane.snapshot()
         return jsonable_encoder(snapshot)
 
-    async def search_instruments(self, *, query: str, market_scope: str) -> dict[str, Any]:
-        results = await self._control_plane.search_instruments(query=query, market_scope=market_scope)
-        return jsonable_encoder({"query": query, "market_scope": market_scope, "instrument_results": results, "schema_version": "v1"})
+    async def search_instruments(self, *, query: str, market_scope: str, provider: str | None = None, instrument_type: str | None = None) -> dict[str, Any]:
+        results = await self._control_plane.search_instruments(
+            query=query,
+            market_scope=market_scope,
+            provider=provider,
+            instrument_type=instrument_type,
+        )
+        return jsonable_encoder({
+            "query": query,
+            "market_scope": market_scope,
+            "provider": (provider or "kxt").strip().lower() or "kxt",
+            "instrument_type": instrument_type,
+            "instrument_results": results,
+            "schema_version": "v1",
+        })
 
     async def upsert_collection_target(self, payload: AdminTargetUpsertRequest) -> dict[str, Any]:
         result = await self._control_plane.upsert_target(
@@ -261,6 +293,9 @@ class CollectorDashboardService:
             market_scope=payload.resolved_market_scope(),
             event_types=payload.event_types,
             enabled=payload.enabled,
+            provider=payload.provider,
+            instrument_type=payload.instrument_type,
+            raw_symbol=payload.raw_symbol,
         )
         return jsonable_encoder(result)
 
@@ -337,22 +372,30 @@ class CollectorDashboardService:
         provider: str | None = None,
         canonical_symbol: str | None = None,
         instrument_type: str | None = None,
+        raw_symbol: str | None = None,
     ) -> None:
+        # Externalise provider at the boundary so neither Kafka envelopes
+        # nor the recent-event buffer ever expose ccxt_pro.
+        external_provider = external_provider_value(provider) if provider else None
         await self._publisher.publish_dashboard_event(
             symbol=symbol,
             market_scope=market_scope,
             event_name=event_name,
             payload=payload,
-            provider=provider,
+            provider=external_provider,
             canonical_symbol=canonical_symbol,
+            instrument_type=instrument_type,
+            raw_symbol=raw_symbol,
         )
         await self._control_plane.record_runtime_event(
             symbol=symbol,
             market_scope=market_scope,
             event_name=event_name,
             payload=payload,
-            provider=provider,
+            provider=external_provider,
             canonical_symbol=canonical_symbol,
+            instrument_type=instrument_type,
+            raw_symbol=raw_symbol,
         )
 
     async def _handle_runtime_failure(self, *, symbol: str, market_scope: str, error: str) -> None:
@@ -452,11 +495,24 @@ async def admin_snapshot() -> JSONResponse:
 @app.get("/admin/instruments")
 async def admin_instrument_search(
     query: str = Query(..., min_length=1),
-    scope: str | None = Query(None, pattern="^(krx|nxt|total)$"),
-    market: str | None = Query(None, pattern="^(krx|nxt|total)$"),
+    scope: str | None = Query(None, pattern="^(krx|nxt|total)?$"),
+    market: str | None = Query(None, pattern="^(krx|nxt|total)?$"),
+    provider: str | None = Query(None, pattern="^(kxt|ccxt|ccxt_pro)$"),
+    instrument_type: str | None = Query(None),
 ) -> JSONResponse:
     try:
-        payload = await dashboard_service.search_instruments(query=query, market_scope=_resolve_market_scope(scope=scope, market=market))
+        provider_text = (provider or "kxt").strip().lower()
+        if provider_text == "kxt":
+            market_scope = _resolve_market_scope(scope=scope, market=market)
+        else:
+            # Crypto sources: market_scope is not applicable.
+            market_scope = (scope or market or "").strip().lower()
+        payload = await dashboard_service.search_instruments(
+            query=query,
+            market_scope=market_scope,
+            provider=provider_text,
+            instrument_type=instrument_type,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(payload)

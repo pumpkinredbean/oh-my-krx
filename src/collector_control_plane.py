@@ -13,10 +13,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from packages.contracts.admin import ControlPlaneSnapshot, EventTypeCatalogEntry, RecentRuntimeEvent
+from packages.contracts.admin import ControlPlaneSnapshot, EventTypeCatalogEntry, RecentRuntimeEvent, SourceCapability
 from packages.contracts.events import EventType
 from packages.contracts.topics import DASHBOARD_EVENTS_TOPIC
-from packages.domain.enums import AssetClass, InstrumentType, Provider, RuntimeState, Venue
+from packages.domain.enums import AssetClass, InstrumentType, Provider, RuntimeState, Venue, external_provider_value
 from packages.domain.models import (
     CollectionTarget,
     CollectionTargetStatus,
@@ -33,6 +33,88 @@ from packages.domain.models import (
 SUPPORTED_MARKET_SCOPES = {"krx", "nxt", "total"}
 
 
+# ---------------------------------------------------------------------------
+# Capability matrix — per (provider, venue, instrument_type)
+# ---------------------------------------------------------------------------
+#
+# This replaces the previous global static event-type catalog.  Each
+# entry advertises which canonical events the source can stream and is
+# the single source of truth for admin-UI event selection + control-plane
+# validation.  Provider keys are the externally exposed values (kxt /
+# ccxt) — ccxt_pro is collapsed at the boundary.
+
+CapabilityKey = tuple[str, str, str]  # (provider_external, venue, instrument_type)
+
+SOURCE_CAPABILITIES: tuple[SourceCapability, ...] = (
+    SourceCapability(
+        provider="kxt",
+        venue="krx",
+        asset_class="equity",
+        instrument_type="spot",
+        label="KRX Equity (KXT)",
+        supported_event_types=(
+            EventType.TRADE.value,
+            EventType.ORDER_BOOK_SNAPSHOT.value,
+            EventType.PROGRAM_TRADE.value,
+        ),
+        market_scope_required=True,
+    ),
+    SourceCapability(
+        provider="ccxt",
+        venue="binance",
+        asset_class="crypto",
+        instrument_type="spot",
+        label="Binance Spot (CCXT)",
+        supported_event_types=(
+            EventType.TRADE.value,
+            EventType.ORDER_BOOK_SNAPSHOT.value,
+            EventType.TICKER.value,
+            EventType.OHLCV.value,
+        ),
+        market_scope_required=False,
+    ),
+    SourceCapability(
+        provider="ccxt",
+        venue="binance",
+        asset_class="crypto",
+        instrument_type="perpetual",
+        label="Binance USDT Perpetual (CCXT)",
+        supported_event_types=(
+            EventType.TRADE.value,
+            EventType.ORDER_BOOK_SNAPSHOT.value,
+            EventType.TICKER.value,
+            EventType.OHLCV.value,
+            EventType.MARK_PRICE.value,
+            EventType.FUNDING_RATE.value,
+            EventType.OPEN_INTEREST.value,
+        ),
+        market_scope_required=False,
+    ),
+)
+
+
+def capability_for(
+    *,
+    provider: Provider | str,
+    venue: Venue | str,
+    instrument_type: InstrumentType | str,
+) -> SourceCapability | None:
+    provider_value = external_provider_value(provider)
+    venue_value = venue.value if isinstance(venue, Venue) else str(venue or "").strip().lower()
+    instrument_value = (
+        instrument_type.value if isinstance(instrument_type, InstrumentType)
+        else str(instrument_type or "").strip().lower()
+    )
+    for entry in SOURCE_CAPABILITIES:
+        if (
+            entry.provider == provider_value
+            and entry.venue == venue_value
+            and entry.instrument_type == instrument_value
+        ):
+            return entry
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class PermanentFailureMeta:
     """Captures KSXT KISSubscriptionError metadata for admin UI display."""
@@ -47,13 +129,25 @@ EVENT_TYPE_ALIASES: dict[str, str] = {
     "trade_price": "trade",
     "order_book_snapshot": "order_book_snapshot",
     "order_book": "order_book_snapshot",
+    "orderbook": "order_book_snapshot",
     "program_trade": "program_trade",
+    "ticker": "ticker",
+    "ohlcv": "ohlcv",
+    "candle": "ohlcv",
+    "mark_price": "mark_price",
+    "funding_rate": "funding_rate",
+    "open_interest": "open_interest",
 }
 
 EVENT_TYPE_DESCRIPTIONS: dict[EventType, str] = {
-    EventType.TRADE: "실시간 체결 이벤트", 
+    EventType.TRADE: "실시간 체결 이벤트",
     EventType.ORDER_BOOK_SNAPSHOT: "실시간 호가 스냅샷 이벤트",
-    EventType.PROGRAM_TRADE: "프로그램 매매 집계 이벤트",
+    EventType.PROGRAM_TRADE: "프로그램 매매 집계 이벤트 (KRX 전용)",
+    EventType.TICKER: "심볼 단위 시세 요약 (best bid/ask + last)",
+    EventType.OHLCV: "OHLCV 캔들/바 이벤트",
+    EventType.MARK_PRICE: "선물/무기한 마크 프라이스",
+    EventType.FUNDING_RATE: "무기한 펀딩비",
+    EventType.OPEN_INTEREST: "선물/무기한 미결제약정",
 }
 
 BOOTSTRAP_INSTRUMENTS: tuple[tuple[str, str], ...] = (
@@ -155,12 +249,25 @@ class CollectorControlPlaneService:
                 ),
             ),
             collection_target_status=statuses,
+            source_capabilities=SOURCE_CAPABILITIES,
             session_state=session_state,
         )
 
-    async def search_instruments(self, *, query: str, market_scope: str | None = None, limit: int = 10, provider: str | Provider | None = None) -> tuple[InstrumentSearchResult, ...]:
+    async def search_instruments(
+        self,
+        *,
+        query: str,
+        market_scope: str | None = None,
+        limit: int = 10,
+        provider: str | Provider | None = None,
+        instrument_type: str | InstrumentType | None = None,
+    ) -> tuple[InstrumentSearchResult, ...]:
         normalized_query = query.strip()
         resolved_provider = self._normalize_provider(provider)
+        resolved_instrument_type = self._normalize_instrument_type(
+            instrument_type,
+            provider=resolved_provider,
+        )
         resolved_market_scope = self._normalize_market_scope(
             market_scope if market_scope is not None else self._default_market_scope,
             provider=resolved_provider,
@@ -173,6 +280,7 @@ class CollectorControlPlaneService:
             target_symbols=target_symbols,
             limit=max(1, min(limit, 50)),
             provider=resolved_provider,
+            instrument_type=resolved_instrument_type,
         )
         async with self._lock:
             self._last_search_results = results
@@ -188,6 +296,7 @@ class CollectorControlPlaneService:
         enabled: bool,
         provider: str | Provider | None = None,
         instrument_type: str | InstrumentType | None = None,
+        raw_symbol: str | None = None,
     ) -> dict[str, object]:
         normalized_symbol = symbol.strip()
         if not normalized_symbol:
@@ -199,7 +308,11 @@ class CollectorControlPlaneService:
             provider=resolved_provider,
         )
         resolved_market_scope = self._normalize_market_scope(market_scope, provider=resolved_provider)
-        normalized_event_types = self._normalize_event_types(event_types)
+        normalized_event_types = self._normalize_event_types(
+            event_types,
+            provider=resolved_provider,
+            instrument_type=resolved_instrument_type,
+        )
         requested_target_id = (target_id or "").strip()
 
         async with self._lock:
@@ -209,8 +322,8 @@ class CollectorControlPlaneService:
                 if existing.instrument.symbol == normalized_symbol
                 and existing.market_scope == resolved_market_scope
                 and (existing.provider or Provider.KXT) == resolved_provider
-                and (existing.instrument.instrument_type or InstrumentType.EQUITY)
-                == (resolved_instrument_type or InstrumentType.EQUITY)
+                and (existing.instrument.instrument_type or InstrumentType.SPOT)
+                == (resolved_instrument_type or InstrumentType.SPOT)
             ]
 
         resolved_target_id = requested_target_id or (existing_target_ids[0] if existing_target_ids else uuid.uuid4().hex)
@@ -218,6 +331,7 @@ class CollectorControlPlaneService:
             normalized_symbol,
             provider=resolved_provider,
             instrument_type=resolved_instrument_type,
+            raw_symbol=raw_symbol,
         )
         target = CollectionTarget(
             target_id=resolved_target_id,
@@ -252,9 +366,10 @@ class CollectorControlPlaneService:
                     market_scope=resolved_market_scope,
                     owner_id=resolved_target_id,
                     event_types=normalized_event_types,
-                    provider=resolved_provider.value,
+                    provider=external_provider_value(resolved_provider),
                     instrument_type=resolved_instrument_type.value if resolved_instrument_type else None,
                     canonical_symbol=instrument_ref.canonical_symbol,
+                    raw_symbol=instrument_ref.raw_symbol,
                 )
             except TypeError:
                 # Backwards compatibility with start_publication callbacks that
@@ -319,10 +434,13 @@ class CollectorControlPlaneService:
         topic_name: str = DASHBOARD_EVENTS_TOPIC,
         provider: str | Provider | None = None,
         canonical_symbol: str | None = None,
+        instrument_type: str | None = None,
+        raw_symbol: str | None = None,
     ) -> None:
         published_at = datetime.utcnow()
         normalized_symbol = symbol.strip()
         resolved_provider = self._normalize_provider(provider)
+        external_provider = external_provider_value(resolved_provider)
         normalized_market_scope = self._normalize_market_scope(market_scope, provider=resolved_provider)
         normalized_event_name = self._normalize_event_name(event_name)
 
@@ -354,8 +472,10 @@ class CollectorControlPlaneService:
                 published_at=published_at,
                 matched_target_ids=matched_target_ids,
                 payload=payload,
-                provider=resolved_provider.value,
+                provider=external_provider,
                 canonical_symbol=canonical_symbol,
+                instrument_type=instrument_type,
+                raw_symbol=raw_symbol,
             )
             self._recent_events.appendleft(event)
             subscribers = list(self._event_subscribers)
@@ -623,9 +743,35 @@ class CollectorControlPlaneService:
         target_symbols: tuple[str, ...],
         limit: int,
         provider: Provider = Provider.KXT,
+        instrument_type: InstrumentType | None = None,
+    ) -> tuple[InstrumentSearchResult, ...]:
+        if provider == Provider.KXT:
+            return self._search_kxt_catalog(
+                query,
+                market_scope,
+                target_symbols=target_symbols,
+                limit=limit,
+                provider=provider,
+                instrument_type=instrument_type,
+            )
+        return self._search_crypto_catalog(
+            query,
+            limit=limit,
+            provider=provider,
+            instrument_type=instrument_type,
+        )
+
+    def _search_kxt_catalog(
+        self,
+        query: str,
+        market_scope: str,
+        *,
+        target_symbols: tuple[str, ...],
+        limit: int,
+        provider: Provider,
+        instrument_type: InstrumentType | None,
     ) -> tuple[InstrumentSearchResult, ...]:
         normalized_query = query.strip().lower()
-        seen_symbols: set[str] = set()
         catalog_entries = list(BOOTSTRAP_INSTRUMENTS)
         if self._default_symbol not in {symbol for symbol, _name in catalog_entries}:
             catalog_entries.append((self._default_symbol, f"종목 {self._default_symbol}"))
@@ -633,8 +779,6 @@ class CollectorControlPlaneService:
             if target_symbol not in {symbol for symbol, _name in catalog_entries}:
                 catalog_entries.append((target_symbol, f"종목 {target_symbol}"))
 
-        # If the query is itself a 6-digit symbol not already in the catalog,
-        # inject it as a direct match so arbitrary KRX codes are always selectable.
         if self._is_krx_symbol(query) and query not in {s for s, _ in catalog_entries}:
             catalog_entries.insert(0, (query, f"종목 {query}"))
 
@@ -648,12 +792,58 @@ class CollectorControlPlaneService:
                     display_name=display_name,
                     market_scope=market_scope,
                     provider=provider,
+                    instrument_type=instrument_type,
                 )
             )
-            seen_symbols.add(symbol)
             if len(results) >= limit:
                 return tuple(results)
+        return tuple(results)
 
+    def _search_crypto_catalog(
+        self,
+        query: str,
+        *,
+        limit: int,
+        provider: Provider,
+        instrument_type: InstrumentType | None,
+    ) -> tuple[InstrumentSearchResult, ...]:
+        """Minimal Binance crypto seed search.
+
+        Step 3 keeps the seed list intentionally tiny — admins can still
+        upsert any unified symbol manually via the form; the seeds are
+        only here so the search affordance returns something usable for
+        Binance spot/perpetual flows.
+        """
+
+        normalized_query = query.strip().upper()
+        seeds: tuple[tuple[str, str, str], ...] = (
+            ("BTC/USDT", "BTCUSDT", "Bitcoin / USDT"),
+            ("ETH/USDT", "ETHUSDT", "Ethereum / USDT"),
+            ("SOL/USDT", "SOLUSDT", "Solana / USDT"),
+            ("XRP/USDT", "XRPUSDT", "XRP / USDT"),
+        )
+        if normalized_query and not any(normalized_query in s[0] or normalized_query in s[1] for s in seeds):
+            # Admin asked for an explicit symbol — surface it as an
+            # injected hit so they can register arbitrary Binance pairs.
+            display = normalized_query if "/" in normalized_query else normalized_query
+            seeds = ((display, normalized_query.replace("/", ""), display),) + seeds
+
+        results: list[InstrumentSearchResult] = []
+        for unified_symbol, raw_symbol, display_name in seeds:
+            if normalized_query and normalized_query not in unified_symbol and normalized_query not in raw_symbol:
+                continue
+            results.append(
+                self._build_search_result(
+                    symbol=unified_symbol,
+                    display_name=display_name,
+                    market_scope="",
+                    provider=provider,
+                    instrument_type=instrument_type,
+                    raw_symbol=raw_symbol,
+                )
+            )
+            if len(results) >= limit:
+                break
         return tuple(results)
 
     def _build_search_result(
@@ -663,14 +853,21 @@ class CollectorControlPlaneService:
         display_name: str,
         market_scope: str,
         provider: Provider = Provider.KXT,
+        instrument_type: InstrumentType | None = None,
+        raw_symbol: str | None = None,
     ) -> InstrumentSearchResult:
-        instrument_ref = self._build_instrument_ref(symbol, provider=provider)
+        instrument_ref = self._build_instrument_ref(
+            symbol,
+            provider=provider,
+            instrument_type=instrument_type,
+            raw_symbol=raw_symbol,
+        )
         return InstrumentSearchResult(
             instrument=instrument_ref,
             display_name=display_name,
             market_scope=market_scope,
-            provider_instrument_id=symbol,
-            venue_code="KRX" if provider == Provider.KXT else None,
+            provider_instrument_id=instrument_ref.raw_symbol or symbol,
+            venue_code=(instrument_ref.venue.value.upper() if instrument_ref.venue else None),
             is_active=True,
             provider=provider,
             canonical_symbol=instrument_ref.canonical_symbol,
@@ -682,35 +879,61 @@ class CollectorControlPlaneService:
         *,
         provider: Provider = Provider.KXT,
         instrument_type: InstrumentType | None = None,
+        raw_symbol: str | None = None,
     ) -> InstrumentRef:
-        # KXT today means KRX equity; other providers default to crypto spot
-        # semantics unless the caller overrides instrument_type.
+        # KXT today means KRX equity (spot trading); other providers
+        # default to crypto spot semantics unless the caller overrides.
         if provider == Provider.KXT:
             venue = Venue.KRX
             asset_class = AssetClass.EQUITY
-            resolved_instrument_type = instrument_type or InstrumentType.EQUITY
+            resolved_instrument_type = instrument_type or InstrumentType.SPOT
+            if resolved_instrument_type == InstrumentType.EQUITY:
+                # Backwards-compat: legacy callers using EQUITY as the
+                # instrument-type axis are normalised to SPOT (KRX trades
+                # equities on the spot market).  Asset class still EQUITY.
+                resolved_instrument_type = InstrumentType.SPOT
+            resolved_raw = raw_symbol or symbol
+            display_symbol = symbol
+            settle_asset: str | None = None
         else:
             venue = Venue.BINANCE
             asset_class = AssetClass.CRYPTO
             resolved_instrument_type = instrument_type or InstrumentType.SPOT
+            display_symbol = symbol
+            resolved_raw = raw_symbol or symbol.replace("/", "").split(":")[0]
+            settle_asset = None
+            if resolved_instrument_type == InstrumentType.PERPETUAL:
+                # Settle asset = the quote currency (USDT for the
+                # default Binance USDT-margined perpetuals).
+                quote = display_symbol.split("/", 1)[1].split(":", 1)[0] if "/" in display_symbol else "USDT"
+                settle_asset = quote.upper()
 
         canonical = build_canonical_symbol(
             provider=provider,
             venue=venue,
+            asset_class=asset_class,
             instrument_type=resolved_instrument_type,
-            symbol=symbol,
+            display_symbol=display_symbol,
+            settle_asset=settle_asset,
         )
         return InstrumentRef(
-            symbol=symbol,
-            instrument_id=symbol,
+            symbol=display_symbol,
+            instrument_id=resolved_raw,
             venue=venue,
             asset_class=asset_class,
             instrument_type=resolved_instrument_type,
             provider=provider,
             canonical_symbol=canonical,
+            raw_symbol=resolved_raw,
         )
 
-    def _normalize_event_types(self, event_types: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    def _normalize_event_types(
+        self,
+        event_types: list[str] | tuple[str, ...],
+        *,
+        provider: Provider | None = None,
+        instrument_type: InstrumentType | None = None,
+    ) -> tuple[str, ...]:
         available = {event_type.value for event_type in EventType}
         normalized = tuple(
             dict.fromkeys(
@@ -724,6 +947,28 @@ class CollectorControlPlaneService:
         invalid = [event_type for event_type in normalized if event_type not in available]
         if invalid:
             raise ValueError(f"unsupported event_types: {', '.join(invalid)}")
+
+        # Capability gating: when provider + instrument_type are known,
+        # reject events the source cannot expose (e.g. mark_price on
+        # Binance spot, program_trade on a non-KRX source).
+        if provider is not None and instrument_type is not None:
+            venue = Venue.KRX if provider == Provider.KXT else Venue.BINANCE
+            capability = capability_for(
+                provider=provider,
+                venue=venue,
+                instrument_type=instrument_type,
+            )
+            if capability is not None:
+                ungated = [
+                    event_type
+                    for event_type in normalized
+                    if event_type not in capability.supported_event_types
+                ]
+                if ungated:
+                    raise ValueError(
+                        "event_types not supported by "
+                        f"{capability.label}: {', '.join(ungated)}"
+                    )
         return normalized
 
     def _normalize_event_name(self, event_name: str | None) -> str:
@@ -773,12 +1018,25 @@ class CollectorControlPlaneService:
         return normalized
 
     def _normalize_provider(self, provider: str | Provider | None) -> Provider:
+        """Map external provider input to the internal :class:`Provider`.
+
+        Accepts only ``kxt`` and ``ccxt`` externally; ``ccxt_pro`` is
+        kept as a deprecated input alias and remapped to
+        :attr:`Provider.CCXT` so that downstream surfaces never expose
+        the ccxt.pro transport detail.
+        """
+
         if provider is None or provider == "":
             return Provider.KXT
         if isinstance(provider, Provider):
+            if provider == Provider.CCXT_PRO:
+                return Provider.CCXT
             return provider
+        text = str(provider).strip().lower()
+        if text == Provider.CCXT_PRO.value:
+            return Provider.CCXT
         try:
-            return Provider(str(provider).strip().lower())
+            return Provider(text)
         except ValueError as exc:
             raise ValueError(f"unsupported provider: {provider}") from exc
 
@@ -789,10 +1047,16 @@ class CollectorControlPlaneService:
         provider: Provider,
     ) -> InstrumentType:
         if instrument_type is None or instrument_type == "":
-            return InstrumentType.EQUITY if provider == Provider.KXT else InstrumentType.SPOT
+            return InstrumentType.SPOT if provider == Provider.KXT else InstrumentType.SPOT
         if isinstance(instrument_type, InstrumentType):
-            return instrument_type
-        try:
-            return InstrumentType(str(instrument_type).strip().lower())
-        except ValueError as exc:
-            raise ValueError(f"unsupported instrument_type: {instrument_type}") from exc
+            resolved = instrument_type
+        else:
+            try:
+                resolved = InstrumentType(str(instrument_type).strip().lower())
+            except ValueError as exc:
+                raise ValueError(f"unsupported instrument_type: {instrument_type}") from exc
+        # KXT-side EQUITY input is normalised to SPOT (KRX equities trade
+        # on the spot market — see canonical_symbol H25 decision).
+        if provider == Provider.KXT and resolved == InstrumentType.EQUITY:
+            resolved = InstrumentType.SPOT
+        return resolved

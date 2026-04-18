@@ -6,7 +6,16 @@ from dataclasses import dataclass
 from decimal import Decimal
 from datetime import datetime
 
-from .enums import AssetClass, InstrumentType, Provider, RuntimeState, StorageBindingScope, TradeSide, Venue
+from .enums import (
+    AssetClass,
+    InstrumentType,
+    Provider,
+    RuntimeState,
+    StorageBindingScope,
+    TradeSide,
+    Venue,
+    external_provider_value,
+)
 
 
 def build_canonical_symbol(
@@ -14,15 +23,27 @@ def build_canonical_symbol(
     provider: Provider | str | None,
     venue: Venue | str | None,
     instrument_type: InstrumentType | str | None,
-    symbol: str,
+    symbol: str | None = None,
+    asset_class: AssetClass | str | None = None,
+    display_symbol: str | None = None,
+    settle_asset: str | None = None,
+    expiry: str | None = None,
 ) -> str:
     """Build the canonical multiprovider identity string.
 
-    Format: ``<provider>:<venue>:<instrument_type>:<symbol>``
+    Format: ``<provider>:<venue>:<asset_class>:<instrument_type>:<display_symbol>[:<settle_asset>][:<expiry>]``
 
-    Missing axes are normalised to ``unknown``.  The helper is intentionally
-    deterministic and dependency-free so adapters, control-plane, and tests
-    can agree on identity without a shared instance.
+    Examples::
+
+        kxt:krx:equity:spot:005930
+        ccxt:binance:crypto:spot:BTC/USDT
+        ccxt:binance:crypto:perpetual:BTC/USDT:USDT
+
+    The ``provider`` axis is always the externally exposed value
+    (``kxt`` or ``ccxt``); ``ccxt_pro`` is collapsed to ``ccxt``.
+
+    ``symbol`` is accepted as a backwards-compatible alias for
+    ``display_symbol`` so step1/step2 callers keep working.
     """
 
     def _norm(value: object) -> str:
@@ -33,7 +54,25 @@ def build_canonical_symbol(
         text = str(value).strip().lower()
         return text or "unknown"
 
-    return f"{_norm(provider)}:{_norm(venue)}:{_norm(instrument_type)}:{symbol}"
+    provider_external = external_provider_value(provider) if provider is not None else "unknown"
+
+    resolved_display = display_symbol or symbol
+    if resolved_display is None:
+        resolved_display = "unknown"
+    display_text = str(resolved_display).strip() or "unknown"
+
+    parts = [
+        provider_external,
+        _norm(venue),
+        _norm(asset_class),
+        _norm(instrument_type),
+        display_text,
+    ]
+    if settle_asset:
+        parts.append(str(settle_asset).strip().upper() or "unknown")
+    if expiry:
+        parts.append(str(expiry).strip() or "unknown")
+    return ":".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +82,10 @@ class InstrumentRef:
     ``provider`` captures the hub/provider axis (KXT vs CCXT/CCXT Pro).
     ``canonical_symbol`` is an optional pre-computed multiprovider identity;
     when omitted callers can derive one via :func:`build_canonical_symbol`.
+    ``raw_symbol`` is the venue-native symbol (e.g. Binance ``BTCUSDT`` or
+    KRX ``005930``) and is split from ``symbol`` (the unified/display
+    symbol such as ``BTC/USDT``) so external surfaces never conflate the
+    two identities.
     """
 
     symbol: str
@@ -52,6 +95,7 @@ class InstrumentRef:
     instrument_type: InstrumentType | None = None
     provider: Provider | None = None
     canonical_symbol: str | None = None
+    raw_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

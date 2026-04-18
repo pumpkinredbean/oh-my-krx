@@ -62,6 +62,8 @@ class CollectorPublisher:
         payload: dict[str, Any],
         provider: str | None = None,
         canonical_symbol: str | None = None,
+        instrument_type: str | None = None,
+        raw_symbol: str | None = None,
     ) -> dict[str, Any]:
         message = _to_transport_value(
             DashboardEventEnvelope(
@@ -72,6 +74,8 @@ class CollectorPublisher:
                 published_at=datetime.utcnow(),
                 provider=provider,
                 canonical_symbol=canonical_symbol,
+                instrument_type=instrument_type,
+                raw_symbol=raw_symbol,
             )
         )
         message["market"] = message["market_scope"]

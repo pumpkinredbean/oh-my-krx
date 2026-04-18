@@ -25,7 +25,18 @@ class ProviderEnumTests(unittest.TestCase):
         from packages.domain.enums import Provider
 
         values = {member.value for member in Provider}
+        # ccxt_pro stays in the enum as an internal alias but MUST NOT
+        # be exposed externally — see external_provider_value().
         self.assertEqual(values, {"kxt", "ccxt", "ccxt_pro", "other"})
+
+    def test_external_provider_value_collapses_ccxt_pro(self) -> None:
+        from packages.domain.enums import Provider, external_provider_value
+
+        self.assertEqual(external_provider_value(Provider.CCXT_PRO), "ccxt")
+        self.assertEqual(external_provider_value("ccxt_pro"), "ccxt")
+        self.assertEqual(external_provider_value(Provider.CCXT), "ccxt")
+        self.assertEqual(external_provider_value(Provider.KXT), "kxt")
+        self.assertEqual(external_provider_value(None), "kxt")
 
     def test_instrument_type_has_spot_and_perpetual(self) -> None:
         from packages.domain.enums import InstrumentType
@@ -41,28 +52,46 @@ class ProviderEnumTests(unittest.TestCase):
 
 class CanonicalSymbolTests(unittest.TestCase):
     def test_build_canonical_symbol_kxt_equity(self) -> None:
-        from packages.domain.enums import InstrumentType, Provider, Venue
+        from packages.domain.enums import AssetClass, InstrumentType, Provider, Venue
         from packages.domain.models import build_canonical_symbol
 
         canonical = build_canonical_symbol(
             provider=Provider.KXT,
             venue=Venue.KRX,
-            instrument_type=InstrumentType.EQUITY,
-            symbol="005930",
+            asset_class=AssetClass.EQUITY,
+            instrument_type=InstrumentType.SPOT,
+            display_symbol="005930",
         )
-        self.assertEqual(canonical, "kxt:krx:equity:005930")
+        self.assertEqual(canonical, "kxt:krx:equity:spot:005930")
 
-    def test_build_canonical_symbol_crypto_perpetual(self) -> None:
-        from packages.domain.enums import InstrumentType, Provider, Venue
+    def test_build_canonical_symbol_crypto_perpetual_includes_settle(self) -> None:
+        from packages.domain.enums import AssetClass, InstrumentType, Provider, Venue
         from packages.domain.models import build_canonical_symbol
 
+        # ccxt_pro input must collapse to ccxt at the canonical boundary.
         canonical = build_canonical_symbol(
             provider=Provider.CCXT_PRO,
             venue=Venue.BINANCE,
+            asset_class=AssetClass.CRYPTO,
             instrument_type=InstrumentType.PERPETUAL,
-            symbol="BTCUSDT",
+            display_symbol="BTC/USDT",
+            settle_asset="USDT",
         )
-        self.assertEqual(canonical, "ccxt_pro:binance:perpetual:BTCUSDT")
+        self.assertEqual(canonical, "ccxt:binance:crypto:perpetual:BTC/USDT:USDT")
+        self.assertNotIn("ccxt_pro", canonical)
+
+    def test_build_canonical_symbol_crypto_spot(self) -> None:
+        from packages.domain.enums import AssetClass, InstrumentType, Provider, Venue
+        from packages.domain.models import build_canonical_symbol
+
+        canonical = build_canonical_symbol(
+            provider=Provider.CCXT,
+            venue=Venue.BINANCE,
+            asset_class=AssetClass.CRYPTO,
+            instrument_type=InstrumentType.SPOT,
+            display_symbol="BTC/USDT",
+        )
+        self.assertEqual(canonical, "ccxt:binance:crypto:spot:BTC/USDT")
 
     def test_build_canonical_symbol_handles_missing_axes(self) -> None:
         from packages.domain.models import build_canonical_symbol
@@ -71,19 +100,23 @@ class CanonicalSymbolTests(unittest.TestCase):
             provider=None,
             venue=None,
             instrument_type=None,
-            symbol="SYM",
+            asset_class=None,
+            display_symbol="SYM",
         )
-        self.assertEqual(canonical, "unknown:unknown:unknown:SYM")
+        self.assertEqual(canonical, "unknown:unknown:unknown:unknown:SYM")
 
 
 class ProviderRegistryTests(unittest.TestCase):
-    def test_default_registry_has_kxt_ccxt_ccxt_pro(self) -> None:
+    def test_default_registry_only_exposes_external_providers(self) -> None:
         from packages.adapters import build_default_registry
         from packages.domain.enums import Provider
 
         registry = build_default_registry()
         providers = set(registry.providers())
-        self.assertEqual(providers, {Provider.KXT, Provider.CCXT, Provider.CCXT_PRO})
+        # Step 3: external surface is restricted to {kxt, ccxt}.
+        # ccxt_pro is internal transport detail and must not appear.
+        self.assertEqual(providers, {Provider.KXT, Provider.CCXT})
+        self.assertNotIn(Provider.CCXT_PRO, providers)
 
     def test_registry_factories_build_stubs(self) -> None:
         from packages.adapters import build_default_registry
@@ -92,15 +125,10 @@ class ProviderRegistryTests(unittest.TestCase):
         registry = build_default_registry()
         kxt = registry.require(Provider.KXT).factory()
         ccxt = registry.require(Provider.CCXT).factory()
-        ccxt_pro = registry.require(Provider.CCXT_PRO).factory()
         self.assertEqual(kxt.adapter_id, "kxt")
         self.assertEqual(ccxt.adapter_id, "ccxt")
-        self.assertEqual(ccxt_pro.adapter_id, "ccxt_pro")
-        # Step 2: KXT and CCXT/CCXT Pro are now wired (CCXT Pro provides the
-        # live BinanceLiveAdapter; CCXT REST descriptor stays for the axis).
         self.assertTrue(kxt.implemented)
         self.assertTrue(ccxt.implemented)
-        self.assertTrue(ccxt_pro.implemented)
 
 
 class ControlPlaneProviderWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -136,9 +164,10 @@ class ControlPlaneProviderWiringTests(unittest.IsolatedAsyncioTestCase):
         target = result["target"]
         # provider field defaults to KXT and canonical_symbol is populated.
         self.assertEqual(target.provider, Provider.KXT)
-        self.assertEqual(target.canonical_symbol, "kxt:krx:equity:005930")
+        self.assertEqual(target.canonical_symbol, "kxt:krx:equity:spot:005930")
         self.assertEqual(target.instrument.provider, Provider.KXT)
-        self.assertEqual(target.instrument.canonical_symbol, "kxt:krx:equity:005930")
+        self.assertEqual(target.instrument.canonical_symbol, "kxt:krx:equity:spot:005930")
+        self.assertEqual(target.instrument.raw_symbol, "005930")
 
     async def test_upsert_target_accepts_non_krx_provider_with_empty_scope(self) -> None:
         from packages.domain.enums import Provider
@@ -146,17 +175,24 @@ class ControlPlaneProviderWiringTests(unittest.IsolatedAsyncioTestCase):
         svc = await self._make_service()
         result = await svc.upsert_target(
             target_id=None,
-            symbol="BTCUSDT",
+            symbol="BTC/USDT",
             market_scope="",  # not applicable for crypto providers
             event_types=["trade"],
             enabled=False,
-            provider="ccxt_pro",
+            provider="ccxt_pro",  # legacy alias — must collapse to ccxt
             instrument_type="perpetual",
+            raw_symbol="BTCUSDT",
         )
         target = result["target"]
-        self.assertEqual(target.provider, Provider.CCXT_PRO)
+        # ccxt_pro input collapses to Provider.CCXT externally.
+        self.assertEqual(target.provider, Provider.CCXT)
         self.assertEqual(target.market_scope, "")
-        self.assertEqual(target.canonical_symbol, "ccxt_pro:binance:perpetual:BTCUSDT")
+        self.assertEqual(
+            target.canonical_symbol,
+            "ccxt:binance:crypto:perpetual:BTC/USDT:USDT",
+        )
+        self.assertNotIn("ccxt_pro", target.canonical_symbol)
+        self.assertEqual(target.instrument.raw_symbol, "BTCUSDT")
 
 
 class RuntimeProviderBranchTests(unittest.IsolatedAsyncioTestCase):

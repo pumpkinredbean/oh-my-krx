@@ -336,14 +336,28 @@ async def collector_container_stop() -> JSONResponse:
 @app.get("/api/admin/instruments")
 async def admin_instrument_search(
     query: str = Query(..., min_length=1),
-    scope: str | None = Query(None, pattern="^(krx|nxt|total)$"),
-    market: str | None = Query(None, pattern="^(krx|nxt|total)$"),
+    scope: str | None = Query(None, pattern="^(krx|nxt|total)?$"),
+    market: str | None = Query(None, pattern="^(krx|nxt|total)?$"),
+    provider: str | None = Query(None, pattern="^(kxt|ccxt|ccxt_pro)$"),
+    instrument_type: str | None = Query(None),
 ) -> JSONResponse:
+    provider_text = (provider or "kxt").strip().lower()
+    if provider_text == "ccxt_pro":
+        # ccxt_pro is internal-only; collapse to ccxt at the boundary.
+        provider_text = "ccxt"
+    params: dict[str, Any] = {"query": query, "provider": provider_text}
     try:
-        market_scope = _resolve_market_scope(scope=scope, market=market)
+        if provider_text == "kxt":
+            params["scope"] = _resolve_market_scope(scope=scope, market=market)
+        else:
+            scoped = (scope or market or "").strip().lower()
+            if scoped:
+                params["scope"] = scoped
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
-    return await _relay_collector_json("GET", "/admin/instruments", params={"query": query, "scope": market_scope})
+    if instrument_type:
+        params["instrument_type"] = instrument_type
+    return await _relay_collector_json("GET", "/admin/instruments", params=params)
 
 
 @app.put("/api/admin/targets")

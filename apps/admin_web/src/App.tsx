@@ -4,10 +4,15 @@ import { NavLink, Navigate, Route, Routes } from 'react-router-dom';
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type MarketScope = 'krx' | 'nxt' | 'total';
+type ProviderId = 'kxt' | 'ccxt';
 
 interface InstrumentRef {
   symbol: string;
   instrument_id?: string | null;
+  raw_symbol?: string | null;
+  instrument_type?: string | null;
+  venue?: string | null;
+  asset_class?: string | null;
 }
 
 interface EventCatalogEntry {
@@ -16,19 +21,33 @@ interface EventCatalogEntry {
   description: string;
 }
 
+interface SourceCapability {
+  provider: ProviderId;
+  venue: string;
+  asset_class: string;
+  instrument_type: string;
+  label: string;
+  supported_event_types: string[];
+  market_scope_required: boolean;
+}
+
 interface InstrumentSearchResult {
   instrument: InstrumentRef;
   display_name: string;
-  market_scope: MarketScope;
+  market_scope: string;
   is_active?: boolean;
+  provider?: ProviderId | null;
+  canonical_symbol?: string | null;
 }
 
 interface CollectionTarget {
   target_id: string;
   instrument: InstrumentRef;
-  market_scope: MarketScope;
+  market_scope: string;
   event_types: string[];
   enabled: boolean;
+  provider?: ProviderId | null;
+  canonical_symbol?: string | null;
 }
 
 interface CollectionTargetStatus {
@@ -56,6 +75,7 @@ interface Snapshot {
   captured_at: string | null;
   source_service: string;
   event_type_catalog: EventCatalogEntry[];
+  source_capabilities?: SourceCapability[];
   collection_targets: CollectionTarget[];
   runtime_status: RuntimeStatus[];
   collection_target_status: CollectionTargetStatus[];
@@ -82,11 +102,19 @@ interface RecentRuntimeEvent {
   published_at: string;
   matched_target_ids: string[];
   payload?: Record<string, unknown>;
+  provider?: ProviderId | null;
+  canonical_symbol?: string | null;
+  instrument_type?: string | null;
+  raw_symbol?: string | null;
 }
 
 // ─── Utils ────────────────────────────────────────────────────────────────────
 
 const MARKET_SCOPES: MarketScope[] = ['krx', 'nxt', 'total'];
+
+function capabilityKey(c: { provider: string; venue: string; instrument_type: string }) {
+  return `${c.provider}:${c.venue}:${c.instrument_type}`;
+}
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
@@ -174,19 +202,28 @@ function ConfirmButton({
 
 interface TargetDraft {
   targetId: string;
+  capabilityKey: string;
   symbol: string;
+  rawSymbol: string;
   scope: MarketScope;
   eventTypes: string[];
   enabled: boolean;
   displayName: string;
 }
 
-function emptyDraft(catalog: EventCatalogEntry[]): TargetDraft {
+function defaultCapability(caps: SourceCapability[]): SourceCapability | null {
+  return caps[0] ?? null;
+}
+
+function emptyDraft(caps: SourceCapability[]): TargetDraft {
+  const cap = defaultCapability(caps);
   return {
     targetId: '',
+    capabilityKey: cap ? capabilityKey(cap) : '',
     symbol: '',
+    rawSymbol: '',
     scope: 'total',
-    eventTypes: catalog.map((e) => e.event_type),
+    eventTypes: cap ? [...cap.supported_event_types] : [],
     enabled: true,
     displayName: '',
   };
@@ -202,14 +239,16 @@ function TargetsView({
   onRefresh: () => Promise<void>;
 }) {
   const catalog = snapshot?.event_type_catalog ?? [];
+  const capabilities = snapshot?.source_capabilities ?? [];
   const targets = snapshot?.collection_targets ?? [];
   const statusMap = Object.fromEntries(
     (snapshot?.collection_target_status ?? []).map((s) => [s.target_id, s]),
   );
+  const capByKey = Object.fromEntries(capabilities.map((c) => [capabilityKey(c), c]));
+  const eventDescByName = Object.fromEntries(catalog.map((e) => [e.event_type, e.description]));
 
-  const [draft, setDraft] = useState<TargetDraft>(() => emptyDraft(catalog));
+  const [draft, setDraft] = useState<TargetDraft>(() => emptyDraft(capabilities));
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchScope, setSearchScope] = useState<MarketScope>('total');
   const [searchResults, setSearchResults] = useState<InstrumentSearchResult[]>([]);
   const [searchMsg, setSearchMsg] = useState('');
   const [searchBusy, setSearchBusy] = useState(false);
@@ -217,19 +256,36 @@ function TargetsView({
   const [formMsg, setFormMsg] = useState('');
   const [formError, setFormError] = useState(false);
 
-  // Keep event types current when catalog loads
+  // Initialise capability key once capabilities arrive.
   useEffect(() => {
-    if (catalog.length > 0 && draft.eventTypes.length === 0 && !draft.symbol) {
-      setDraft((d) => ({ ...d, eventTypes: catalog.map((e) => e.event_type) }));
+    if (capabilities.length > 0 && !draft.capabilityKey) {
+      const cap = defaultCapability(capabilities)!;
+      setDraft((d) => ({
+        ...d,
+        capabilityKey: capabilityKey(cap),
+        eventTypes: [...cap.supported_event_types],
+      }));
     }
-  }, [catalog.length]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [capabilities.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const selectedCapability: SourceCapability | null =
+    capByKey[draft.capabilityKey] ?? defaultCapability(capabilities);
 
   function pickTarget(t: CollectionTarget, name = '') {
+    // Resolve the source preset that matches the existing target.
+    const inst = t.instrument;
+    const matchedKey = capabilityKey({
+      provider: (t.provider ?? inst.provider ?? 'kxt') as string,
+      venue: (inst.venue ?? (t.provider === 'ccxt' ? 'binance' : 'krx')) as string,
+      instrument_type: (inst.instrument_type ?? 'spot') as string,
+    });
     setDraft({
       targetId: t.target_id,
+      capabilityKey: capByKey[matchedKey] ? matchedKey : draft.capabilityKey,
       symbol: t.instrument.symbol,
-      scope: t.market_scope,
-      eventTypes: t.event_types.length ? t.event_types : catalog.map((e) => e.event_type),
+      rawSymbol: t.instrument.raw_symbol ?? '',
+      scope: (t.market_scope || 'total') as MarketScope,
+      eventTypes: t.event_types.length ? t.event_types : (capByKey[matchedKey]?.supported_event_types ?? []),
       enabled: t.enabled,
       displayName: name || t.instrument.instrument_id || '',
     });
@@ -238,39 +294,50 @@ function TargetsView({
   }
 
   function pickSearchResult(r: InstrumentSearchResult) {
-    const existing = targets.find(
-      (t) => t.instrument.symbol === r.instrument.symbol && t.market_scope === r.market_scope,
-    );
-    if (existing) {
-      pickTarget(existing, r.display_name);
-    } else {
-      setDraft({
-        targetId: '',
-        symbol: r.instrument.symbol,
-        scope: r.market_scope,
-        eventTypes: catalog.map((e) => e.event_type),
-        enabled: true,
-        displayName: r.display_name,
-      });
-    }
+    const inst = r.instrument;
+    setDraft((d) => ({
+      ...d,
+      targetId: '',
+      symbol: inst.symbol,
+      rawSymbol: inst.raw_symbol ?? '',
+      displayName: r.display_name,
+    }));
     setFormMsg('');
     setFormError(false);
   }
 
   function resetDraft() {
-    setDraft(emptyDraft(catalog));
+    setDraft(emptyDraft(capabilities));
     setFormMsg('');
     setFormError(false);
+  }
+
+  function changeSourcePreset(key: string) {
+    const cap = capByKey[key];
+    if (!cap) return;
+    setDraft((d) => ({
+      ...d,
+      capabilityKey: key,
+      // Reset event-type checkboxes to the new source's full capability.
+      eventTypes: [...cap.supported_event_types],
+      // KRX scope only meaningful for kxt.
+      scope: cap.market_scope_required ? d.scope || 'total' : 'total',
+    }));
   }
 
   async function doSearch(e: FormEvent) {
     e.preventDefault();
     if (!searchQuery.trim()) return;
+    const cap = selectedCapability;
+    if (!cap) return;
     setSearchBusy(true);
     setSearchMsg('');
     try {
+      const params = new URLSearchParams({ query: searchQuery.trim(), provider: cap.provider });
+      params.set('instrument_type', cap.instrument_type);
+      if (cap.market_scope_required) params.set('scope', draft.scope);
       const r = await requestJson<{ instrument_results: InstrumentSearchResult[] }>(
-        `/api/admin/instruments?query=${encodeURIComponent(searchQuery.trim())}&scope=${searchScope}`,
+        `/api/admin/instruments?${params.toString()}`,
       );
       setSearchResults(r.instrument_results ?? []);
       setSearchMsg(`${r.instrument_results?.length ?? 0}건`);
@@ -284,8 +351,14 @@ function TargetsView({
 
   async function doSave(e: FormEvent) {
     e.preventDefault();
+    const cap = selectedCapability;
+    if (!cap) {
+      setFormMsg('소스 프리셋이 없습니다.');
+      setFormError(true);
+      return;
+    }
     if (!draft.symbol.trim()) {
-      setFormMsg('종목코드를 입력하세요.');
+      setFormMsg('종목/심볼을 입력하세요.');
       setFormError(true);
       return;
     }
@@ -298,16 +371,24 @@ function TargetsView({
     setFormMsg('');
     setFormError(false);
     try {
+      const body: Record<string, unknown> = {
+        target_id: draft.targetId || undefined,
+        symbol: draft.symbol.trim(),
+        event_types: draft.eventTypes,
+        enabled: draft.enabled,
+        provider: cap.provider,
+        instrument_type: cap.instrument_type,
+      };
+      if (cap.market_scope_required) {
+        body.market_scope = draft.scope;
+      } else {
+        body.market_scope = '';
+      }
+      if (draft.rawSymbol.trim()) body.raw_symbol = draft.rawSymbol.trim();
       const r = await requestJson<TargetMutationResponse>('/api/admin/targets', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          target_id: draft.targetId || undefined,
-          symbol: draft.symbol.trim(),
-          market_scope: draft.scope,
-          event_types: draft.eventTypes,
-          enabled: draft.enabled,
-        }),
+        body: JSON.stringify(body),
       });
       setFormMsg(r.warning ? `저장됨 (경고: ${r.warning})` : '저장되었습니다.');
       await onRefresh();
@@ -340,9 +421,7 @@ function TargetsView({
     }
   }
 
-  const isUpdate = !!draft.targetId || targets.some(
-    (t) => t.instrument.symbol === draft.symbol.trim() && t.market_scope === draft.scope,
-  );
+  const isUpdate = !!draft.targetId;
 
   return (
     <div className="view-grid targets-grid">
@@ -351,22 +430,15 @@ function TargetsView({
         {/* Search panel */}
         <section className="panel">
           <div className="panel-head">
-            <span className="eyebrow">Instrument Search</span>
+            <span className="eyebrow">Instrument Search ({selectedCapability?.label ?? 'no source'})</span>
           </div>
           <form className="search-bar" onSubmit={doSearch}>
             <input
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="005930 · 삼성전자"
+              placeholder={selectedCapability?.provider === 'ccxt' ? 'BTC/USDT · BTCUSDT' : '005930 · 삼성전자'}
             />
-            <select value={searchScope} onChange={(e) => setSearchScope(e.target.value as MarketScope)}>
-              {MARKET_SCOPES.map((s) => (
-                <option key={s} value={s}>
-                  {s.toUpperCase()}
-                </option>
-              ))}
-            </select>
-            <button type="submit" disabled={searchBusy}>
+            <button type="submit" disabled={searchBusy || !selectedCapability}>
               {searchBusy ? '…' : '검색'}
             </button>
           </form>
@@ -376,8 +448,8 @@ function TargetsView({
               <table>
                 <thead>
                   <tr>
-                    <th>종목</th>
-                    <th>시장</th>
+                    <th>심볼</th>
+                    <th>raw</th>
                     <th>등록</th>
                     <th />
                   </tr>
@@ -385,17 +457,15 @@ function TargetsView({
                 <tbody>
                   {searchResults.map((r) => {
                     const registered = targets.some(
-                      (t) => t.instrument.symbol === r.instrument.symbol && t.market_scope === r.market_scope,
+                      (t) => t.canonical_symbol && t.canonical_symbol === r.canonical_symbol,
                     );
                     return (
-                      <tr key={`${r.instrument.symbol}-${r.market_scope}`}>
+                      <tr key={r.canonical_symbol ?? r.instrument.symbol}>
                         <td>
                           <strong>{r.instrument.symbol}</strong>
                           <div className="sub">{r.display_name}</div>
                         </td>
-                        <td>
-                          <Badge label={r.market_scope.toUpperCase()} tone="default" />
-                        </td>
+                        <td className="mono small">{r.instrument.raw_symbol ?? '—'}</td>
                         <td>
                           {registered ? (
                             <Badge label="등록됨" tone="good" />
@@ -434,7 +504,7 @@ function TargetsView({
               <table>
                 <thead>
                   <tr>
-                    <th>종목</th>
+                    <th>소스 · 심볼</th>
                     <th>이벤트</th>
                     <th>상태</th>
                     <th>마지막 이벤트</th>
@@ -445,6 +515,8 @@ function TargetsView({
                   {targets.map((t) => {
                     const st = statusMap[t.target_id];
                     const permanent = st?.permanent_failure;
+                    const provider = (t.provider ?? 'kxt') as string;
+                    const itype = t.instrument.instrument_type ?? '—';
                     const failureSummary = permanent
                       ? `${st?.failure_reason ?? 'permanent_failure'}${st?.failure_rt_cd ? ` (${st.failure_rt_cd})` : ''}${st?.failure_attempts != null ? ` · ${st.failure_attempts}회` : ''}`
                       : '';
@@ -463,7 +535,15 @@ function TargetsView({
                         <td>
                           <strong>{t.instrument.symbol}</strong>
                           <div className="sub">
-                            <Badge label={t.market_scope.toUpperCase()} tone="default" />
+                            <Badge label={provider.toUpperCase()} tone="default" />
+                            {' '}
+                            <Badge label={itype} tone="default" />
+                            {t.market_scope && (
+                              <>
+                                {' '}
+                                <Badge label={t.market_scope.toUpperCase()} tone="default" />
+                              </>
+                            )}
                             {' '}
                             {t.enabled ? (
                               <Badge label="활성" tone="good" />
@@ -471,6 +551,9 @@ function TargetsView({
                               <Badge label="비활성" tone="muted" />
                             )}
                           </div>
+                          {t.canonical_symbol && (
+                            <div className="sub mono small">{t.canonical_symbol}</div>
+                          )}
                         </td>
                         <td className="event-pills">
                           {t.event_types.map((ev) => (
@@ -522,44 +605,77 @@ function TargetsView({
           <span className="eyebrow">{isUpdate ? 'Update Target' : 'New Target'}</span>
           {draft.symbol && (
             <span className="identity-label">
-              {draft.symbol} · {draft.scope.toUpperCase()}
+              {draft.symbol}
+              {selectedCapability ? ` · ${selectedCapability.label}` : ''}
             </span>
           )}
         </div>
 
         <form className="col-stack" onSubmit={doSave}>
+          {/* Source preset (provider/venue/instrument_type) */}
+          <label className="field">
+            <span>소스 (provider · venue · instrument_type)</span>
+            <select
+              value={draft.capabilityKey}
+              onChange={(e) => changeSourcePreset(e.target.value)}
+            >
+              {capabilities.map((c) => (
+                <option key={capabilityKey(c)} value={capabilityKey(c)}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
           <div className="field-row">
             <label className="field">
-              <span>종목코드</span>
+              <span>심볼 (display)</span>
               <input
                 value={draft.symbol}
                 onChange={(e) => setDraft((d) => ({ ...d, symbol: e.target.value }))}
-                placeholder="005930"
+                placeholder={selectedCapability?.provider === 'ccxt' ? 'BTC/USDT' : '005930'}
               />
             </label>
-            <label className="field">
-              <span>시장 범위</span>
-              <select
-                value={draft.scope}
-                onChange={(e) => setDraft((d) => ({ ...d, scope: e.target.value as MarketScope }))}
-              >
-                {MARKET_SCOPES.map((s) => (
-                  <option key={s} value={s}>
-                    {s.toUpperCase()}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {selectedCapability?.provider === 'ccxt' && (
+              <label className="field">
+                <span>raw_symbol</span>
+                <input
+                  value={draft.rawSymbol}
+                  onChange={(e) => setDraft((d) => ({ ...d, rawSymbol: e.target.value }))}
+                  placeholder="BTCUSDT"
+                />
+              </label>
+            )}
+            {selectedCapability?.market_scope_required && (
+              <label className="field">
+                <span>시장 범위</span>
+                <select
+                  value={draft.scope}
+                  onChange={(e) => setDraft((d) => ({ ...d, scope: e.target.value as MarketScope }))}
+                >
+                  {MARKET_SCOPES.map((s) => (
+                    <option key={s} value={s}>
+                      {s.toUpperCase()}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
           </div>
 
           <div className="field-block">
             <div className="field-block-head">
-              <span>수집 이벤트</span>
+              <span>수집 이벤트 (capability-filtered)</span>
               <div className="inline-actions">
                 <button
                   type="button"
                   className="sm-btn"
-                  onClick={() => setDraft((d) => ({ ...d, eventTypes: catalog.map((e) => e.event_type) }))}
+                  onClick={() =>
+                    setDraft((d) => ({
+                      ...d,
+                      eventTypes: selectedCapability ? [...selectedCapability.supported_event_types] : [],
+                    }))
+                  }
                 >
                   전체
                 </button>
@@ -573,10 +689,10 @@ function TargetsView({
               </div>
             </div>
             <div className="check-grid">
-              {catalog.map((entry) => {
-                const checked = draft.eventTypes.includes(entry.event_type);
+              {(selectedCapability?.supported_event_types ?? []).map((evType) => {
+                const checked = draft.eventTypes.includes(evType);
                 return (
-                  <label key={entry.event_type} className="check-card">
+                  <label key={evType} className="check-card">
                     <input
                       type="checkbox"
                       checked={checked}
@@ -584,14 +700,14 @@ function TargetsView({
                         setDraft((d) => ({
                           ...d,
                           eventTypes: checked
-                            ? d.eventTypes.filter((v) => v !== entry.event_type)
-                            : [...d.eventTypes, entry.event_type],
+                            ? d.eventTypes.filter((v) => v !== evType)
+                            : [...d.eventTypes, evType],
                         }))
                       }
                     />
                     <span>
-                      <strong>{entry.event_type}</strong>
-                      <small>{entry.description}</small>
+                      <strong>{evType}</strong>
+                      <small>{eventDescByName[evType] ?? ''}</small>
                     </span>
                   </label>
                 );
@@ -693,7 +809,12 @@ function RuntimeView({ snapshot, onRefresh }: { snapshot: Snapshot | null; onRef
 
   // Build symbol+scope label from targets for better UX
   const labelByTargetId = Object.fromEntries(
-    targets.map((t) => [t.target_id, `${t.instrument.symbol} · ${t.market_scope.toUpperCase()}`]),
+    targets.map((t) => {
+      const provider = (t.provider ?? 'kxt').toUpperCase();
+      const itype = t.instrument.instrument_type ?? '—';
+      const scope = t.market_scope ? ` · ${t.market_scope.toUpperCase()}` : '';
+      return [t.target_id, `${t.instrument.symbol} · ${provider} · ${itype}${scope}`];
+    }),
   );
 
   return (
@@ -1091,7 +1212,24 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
                       </td>
                       <td>
                         <strong>{ev.symbol}</strong>
-                        <span className="sub"> · {ev.market_scope.toUpperCase()}</span>
+                        {ev.provider && (
+                          <>
+                            <span className="sub"> · </span>
+                            <Badge label={ev.provider.toUpperCase()} tone="default" />
+                          </>
+                        )}
+                        {ev.instrument_type && (
+                          <>
+                            {' '}
+                            <Badge label={ev.instrument_type} tone="default" />
+                          </>
+                        )}
+                        {ev.market_scope && (
+                          <span className="sub"> · {ev.market_scope.toUpperCase()}</span>
+                        )}
+                        {ev.canonical_symbol && (
+                          <div className="sub mono small">{ev.canonical_symbol}</div>
+                        )}
                       </td>
                       <td className="mono small">{ev.topic_name}</td>
                       <td>{ev.matched_target_ids.length > 0 ? ev.matched_target_ids.length : '—'}</td>

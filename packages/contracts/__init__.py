@@ -1,6 +1,6 @@
 """Transport-safe shared contracts for broker-agnostic events."""
 
-from .admin import ControlPlaneSnapshot, EventTypeCatalogEntry
+from .admin import ControlPlaneSnapshot, EventTypeCatalogEntry, SourceCapability
 from .events import CanonicalEvent, CanonicalEventEnvelope, DashboardControlEnvelope, DashboardEventEnvelope, EventType
 from .subscriptions import ChannelType, SubscriptionSpec
 from .topics import (
@@ -30,6 +30,7 @@ __all__ = [
     "ORDER_BOOK_SNAPSHOT_TOPIC",
     "PROGRAM_TRADE_TOPIC",
     "RAW_EVENTS_TOPIC",
+    "SourceCapability",
     "SubscriptionSpec",
     "TRADE_TOPIC",
 ]

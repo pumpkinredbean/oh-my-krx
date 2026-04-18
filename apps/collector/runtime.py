@@ -27,7 +27,7 @@ from kxt import (
 )
 
 from packages.contracts import EventType
-from packages.domain.enums import InstrumentType, Provider, Venue
+from packages.domain.enums import AssetClass, InstrumentType, Provider, Venue, external_provider_value
 from packages.adapters.ccxt import (
     BinanceLiveAdapter,
     BinanceOrderBookSnapshot,
@@ -74,6 +74,7 @@ class RuntimeTargetRegistration:
     provider: Provider = Provider.KXT
     canonical_symbol: str | None = None
     instrument_type: InstrumentType | None = None
+    raw_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +347,7 @@ class CollectorRuntime:
         provider: str | Provider | None = None,
         canonical_symbol: str | None = None,
         instrument_type: str | InstrumentType | None = None,
+        raw_symbol: str | None = None,
     ) -> RuntimeTargetRegistration:
         normalized_owner_id = owner_id.strip()
         if not normalized_owner_id:
@@ -364,9 +366,10 @@ class CollectorRuntime:
                 provider=resolved_provider,
                 canonical_symbol=canonical_symbol,
                 instrument_type=resolved_instrument_type,
+                raw_symbol=raw_symbol or symbol,
             )
 
-        if resolved_provider in (Provider.CCXT, Provider.CCXT_PRO):
+        if resolved_provider == Provider.CCXT:
             return await self._register_crypto_target(
                 owner_id=normalized_owner_id,
                 symbol=symbol,
@@ -374,6 +377,7 @@ class CollectorRuntime:
                 provider=resolved_provider,
                 canonical_symbol=canonical_symbol,
                 instrument_type=resolved_instrument_type,
+                raw_symbol=raw_symbol,
             )
 
         raise NotImplementedError(
@@ -390,6 +394,7 @@ class CollectorRuntime:
         provider: Provider,
         canonical_symbol: str | None,
         instrument_type: InstrumentType | None,
+        raw_symbol: str | None,
     ) -> RuntimeTargetRegistration:
         stream_key = self._build_stream_key(symbol=symbol, market_scope=market_scope)
         registration = RuntimeTargetRegistration(
@@ -399,6 +404,7 @@ class CollectorRuntime:
             provider=provider,
             canonical_symbol=canonical_symbol,
             instrument_type=instrument_type,
+            raw_symbol=raw_symbol,
         )
 
         await self._wait_session_ready(timeout=self._SESSION_READY_TIMEOUT)
@@ -432,6 +438,7 @@ class CollectorRuntime:
         provider: Provider,
         canonical_symbol: str | None,
         instrument_type: InstrumentType | None,
+        raw_symbol: str | None,
     ) -> RuntimeTargetRegistration:
         normalized_symbol = symbol.strip()
         if not normalized_symbol:
@@ -443,16 +450,30 @@ class CollectorRuntime:
                 f"unsupported crypto instrument_type: {resolved_instrument_type.value}"
             )
 
+        # Display symbol (unified ccxt form, e.g. BTC/USDT) and raw symbol
+        # (venue-native, e.g. BTCUSDT) are split on the external surface.
+        display_symbol = to_unified_symbol(normalized_symbol, resolved_instrument_type)
+        if resolved_instrument_type == InstrumentType.PERPETUAL:
+            base_quote, _, settle = display_symbol.partition(":")
+            settle_asset = (settle or base_quote.split("/", 1)[1]).upper()
+            base_quote_for_raw = base_quote
+        else:
+            settle_asset = None
+            base_quote_for_raw = display_symbol
+        resolved_raw = raw_symbol or normalized_symbol or base_quote_for_raw.replace("/", "")
+
         resolved_canonical = canonical_symbol or build_canonical_symbol(
             provider=provider,
             venue=Venue.BINANCE,
+            asset_class=AssetClass.CRYPTO,
             instrument_type=resolved_instrument_type,
-            symbol=normalized_symbol,
+            display_symbol=base_quote_for_raw if resolved_instrument_type == InstrumentType.PERPETUAL else display_symbol,
+            settle_asset=settle_asset,
         )
 
         # Crypto targets do not carry a KRX market_scope; use the empty scope
         # so dashboard plumbing receives a not-applicable signal.
-        stream_key = DashboardStreamKey(symbol=normalized_symbol, market_scope="")
+        stream_key = DashboardStreamKey(symbol=resolved_raw, market_scope="")
         registration = RuntimeTargetRegistration(
             owner_id=owner_id,
             stream_key=stream_key,
@@ -460,6 +481,7 @@ class CollectorRuntime:
             provider=provider,
             canonical_symbol=resolved_canonical,
             instrument_type=resolved_instrument_type,
+            raw_symbol=resolved_raw,
         )
 
         async with self._lock:
@@ -471,8 +493,12 @@ class CollectorRuntime:
                 previous_canonical = previous.canonical_symbol or build_canonical_symbol(
                     provider=previous.provider,
                     venue=Venue.BINANCE,
+                    asset_class=AssetClass.CRYPTO,
                     instrument_type=previous.instrument_type or InstrumentType.SPOT,
-                    symbol=previous.stream_key.symbol,
+                    display_symbol=to_unified_symbol(
+                        previous.raw_symbol or previous.stream_key.symbol,
+                        previous.instrument_type or InstrumentType.SPOT,
+                    ).split(":", 1)[0],
                 )
                 previous_channels = {
                     _CryptoChannelKey(canonical_symbol=previous_canonical, event_name=ev)
@@ -514,8 +540,12 @@ class CollectorRuntime:
                     canonical = registration.canonical_symbol or build_canonical_symbol(
                         provider=registration.provider,
                         venue=Venue.BINANCE,
+                        asset_class=AssetClass.CRYPTO,
                         instrument_type=registration.instrument_type or InstrumentType.SPOT,
-                        symbol=registration.stream_key.symbol,
+                        display_symbol=to_unified_symbol(
+                            registration.raw_symbol or registration.stream_key.symbol,
+                            registration.instrument_type or InstrumentType.SPOT,
+                        ).split(":", 1)[0],
                     )
                     crypto_to_release = {
                         _CryptoChannelKey(canonical_symbol=canonical, event_name=ev)
@@ -835,9 +865,10 @@ class CollectorRuntime:
                     market_scope="",
                     event_name=published_event_name,
                     payload=payload,
-                    provider=provider.value,
+                    provider=external_provider_value(provider),
                     canonical_symbol=channel_key.canonical_symbol,
                     instrument_type=instrument_type.value,
+                    raw_symbol=symbol,
                 )
         except asyncio.CancelledError:
             raise
@@ -950,6 +981,7 @@ class CollectorRuntime:
         provider: str | None = None,
         canonical_symbol: str | None = None,
         instrument_type: str | None = None,
+        raw_symbol: str | None = None,
     ) -> None:
         if self._on_event is None:
             return
@@ -962,6 +994,7 @@ class CollectorRuntime:
                 provider=provider,
                 canonical_symbol=canonical_symbol,
                 instrument_type=instrument_type,
+                raw_symbol=raw_symbol,
             )
         except TypeError:
             # Backwards-compat: legacy on_event handlers (KXT-only) accept
@@ -1031,12 +1064,22 @@ class CollectorRuntime:
 
     @staticmethod
     def _resolve_provider(provider: str | Provider | None) -> Provider:
+        """Resolve the externally exposed provider value (kxt or ccxt).
+
+        ``ccxt_pro`` is accepted as a deprecated alias and remapped to
+        :attr:`Provider.CCXT` so the runtime never carries the
+        ccxt.pro transport detail past the boundary.
+        """
+
         if provider is None or provider == "":
             return Provider.KXT
         if isinstance(provider, Provider):
-            return provider
+            return Provider.CCXT if provider == Provider.CCXT_PRO else provider
+        text = str(provider).strip().lower()
+        if text == Provider.CCXT_PRO.value:
+            return Provider.CCXT
         try:
-            return Provider(str(provider).strip().lower())
+            return Provider(text)
         except ValueError as exc:
             raise ValueError(f"unsupported provider: {provider}") from exc
 
@@ -1048,16 +1091,20 @@ class CollectorRuntime:
     ) -> InstrumentType | None:
         if instrument_type is None or instrument_type == "":
             if provider == Provider.KXT:
-                return InstrumentType.EQUITY
+                return InstrumentType.SPOT
             if provider in (Provider.CCXT, Provider.CCXT_PRO):
                 return InstrumentType.SPOT
             return None
         if isinstance(instrument_type, InstrumentType):
-            return instrument_type
-        try:
-            return InstrumentType(str(instrument_type).strip().lower())
-        except ValueError as exc:
-            raise ValueError(f"unsupported instrument_type: {instrument_type}") from exc
+            resolved = instrument_type
+        else:
+            try:
+                resolved = InstrumentType(str(instrument_type).strip().lower())
+            except ValueError as exc:
+                raise ValueError(f"unsupported instrument_type: {instrument_type}") from exc
+        if provider == Provider.KXT and resolved == InstrumentType.EQUITY:
+            return InstrumentType.SPOT
+        return resolved
 
     def _normalize_event_types(self, event_types: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
         if event_types is None:

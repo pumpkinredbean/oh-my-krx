@@ -105,13 +105,14 @@ class RuntimeCryptoBranchTests(unittest.IsolatedAsyncioTestCase):
                 symbol="BTCUSDT",
                 market_scope="",
                 event_types=("trade",),
-                provider="ccxt_pro",
+                provider="ccxt_pro",  # deprecated alias — must collapse to ccxt
                 instrument_type="spot",
             )
-            self.assertEqual(registration.provider, Provider.CCXT_PRO)
+            # Externally, ccxt_pro is collapsed to ccxt.
+            self.assertEqual(registration.provider, Provider.CCXT)
             self.assertEqual(
                 registration.canonical_symbol,
-                "ccxt_pro:binance:spot:BTCUSDT",
+                "ccxt:binance:crypto:spot:BTC/USDT",
             )
 
             for _ in range(50):
@@ -121,14 +122,17 @@ class RuntimeCryptoBranchTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(events, "expected at least one published event")
             ev = events[0]
-            self.assertEqual(ev["symbol"], "BTCUSDT")
-            self.assertEqual(ev["market_scope"], "")
             self.assertEqual(ev["event_name"], "trade_price")
-            self.assertEqual(ev["provider"], "ccxt_pro")
+            # Provider on outgoing payload must be the externally exposed
+            # ``ccxt`` value — never ``ccxt_pro``.
+            self.assertEqual(ev["provider"], "ccxt")
+            self.assertNotEqual(ev["provider"], "ccxt_pro")
             self.assertEqual(
-                ev["canonical_symbol"], "ccxt_pro:binance:spot:BTCUSDT"
+                ev["canonical_symbol"], "ccxt:binance:crypto:spot:BTC/USDT"
             )
+            self.assertNotIn("ccxt_pro", ev["canonical_symbol"])
             self.assertEqual(ev["instrument_type"], "spot")
+            self.assertIn("raw_symbol", ev)
         finally:
             await runtime.aclose()
 
@@ -150,7 +154,7 @@ class RuntimeCryptoBranchTests(unittest.IsolatedAsyncioTestCase):
                 symbol="BTCUSDT",
                 market_scope="",
                 event_types=("trade",),
-                provider="ccxt_pro",
+                provider="ccxt",
                 instrument_type="spot",
             )
             await runtime.register_target(
@@ -158,17 +162,17 @@ class RuntimeCryptoBranchTests(unittest.IsolatedAsyncioTestCase):
                 symbol="BTCUSDT",
                 market_scope="",
                 event_types=("trade",),
-                provider="ccxt_pro",
+                provider="ccxt",
                 instrument_type="perpetual",
             )
             # Both registrations exist independently in the registry.
             self.assertEqual(
                 runtime._registrations_by_owner["t-spot"].canonical_symbol,
-                "ccxt_pro:binance:spot:BTCUSDT",
+                "ccxt:binance:crypto:spot:BTC/USDT",
             )
             self.assertEqual(
                 runtime._registrations_by_owner["t-perp"].canonical_symbol,
-                "ccxt_pro:binance:perpetual:BTCUSDT",
+                "ccxt:binance:crypto:perpetual:BTC/USDT:USDT",
             )
             # Two distinct crypto channels — spot/perpetual cannot collide.
             self.assertEqual(len(runtime._crypto_channels), 2)
@@ -200,32 +204,34 @@ class ControlPlaneCryptoMatchingTests(unittest.IsolatedAsyncioTestCase):
 
         spot = await svc.upsert_target(
             target_id=None,
-            symbol="BTCUSDT",
+            symbol="BTC/USDT",
             market_scope="",
             event_types=["trade"],
             enabled=True,
-            provider="ccxt_pro",
+            provider="ccxt",
             instrument_type="spot",
+            raw_symbol="BTCUSDT",
         )
         perp = await svc.upsert_target(
             target_id=None,
-            symbol="BTCUSDT",
+            symbol="BTC/USDT",
             market_scope="",
             event_types=["trade"],
             enabled=True,
-            provider="ccxt_pro",
+            provider="ccxt_pro",  # legacy alias still accepted
             instrument_type="perpetual",
+            raw_symbol="BTCUSDT",
         )
         # Different canonical_symbol → not deduplicated.
         self.assertNotEqual(spot["target"].target_id, perp["target"].target_id)
 
         await svc.record_runtime_event(
-            symbol="BTCUSDT",
+            symbol="BTC/USDT",
             market_scope="",
             event_name="trade",
             payload={"price": 1},
-            provider="ccxt_pro",
-            canonical_symbol="ccxt_pro:binance:perpetual:BTCUSDT",
+            provider="ccxt_pro",  # legacy alias still accepted on input
+            canonical_symbol="ccxt:binance:crypto:perpetual:BTC/USDT:USDT",
         )
 
         recent = await svc.recent_events(limit=10)
@@ -233,8 +239,13 @@ class ControlPlaneCryptoMatchingTests(unittest.IsolatedAsyncioTestCase):
         ev = recent["recent_events"][0]
         # Only the perpetual target matched.
         self.assertEqual(ev.matched_target_ids, (perp["target"].target_id,))
-        self.assertEqual(ev.canonical_symbol, "ccxt_pro:binance:perpetual:BTCUSDT")
-        self.assertEqual(ev.provider, "ccxt_pro")
+        self.assertEqual(
+            ev.canonical_symbol,
+            "ccxt:binance:crypto:perpetual:BTC/USDT:USDT",
+        )
+        # External provider value must collapse ccxt_pro → ccxt.
+        self.assertEqual(ev.provider, "ccxt")
+        self.assertNotEqual(ev.provider, "ccxt_pro")
 
 
 if __name__ == "__main__":  # pragma: no cover

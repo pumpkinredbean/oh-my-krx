@@ -65,16 +65,17 @@ class ProviderRegistry:
 def build_default_registry() -> ProviderRegistry:
     """Build the default provider registry wired for this hub build.
 
-    KXT is eagerly registered because the KRX runtime is the only path
-    that is fully implemented today.  CCXT / CCXT Pro are registered as
-    skeletons so callers can detect that the provider axis exists without
-    needing an exchange SDK at import time.
+    Externally exposed providers are limited to ``KXT`` and ``CCXT``.
+    The CCXT entry's factory builds the live ``BinanceLiveAdapter``
+    backed by ``ccxt.pro`` — that transport detail is intentionally
+    hidden behind the CCXT provider so it never leaks through registry
+    listings, snapshots, or admin UI.
     """
 
     # Local imports keep top-level import cost bounded and avoid pulling
     # optional dependencies unless the adapter is actually constructed.
     from .kxt import build_kxt_adapter_stub
-    from .ccxt import build_ccxt_adapter_stub, build_ccxt_pro_adapter_stub
+    from .ccxt import build_ccxt_adapter_stub
 
     registry = ProviderRegistry()
     registry.register(
@@ -88,19 +89,10 @@ def build_default_registry() -> ProviderRegistry:
     registry.register(
         ProviderRegistration(
             provider=Provider.CCXT,
-            description="CCXT REST provider descriptor (Binance spot/perpetual)",
+            description="CCXT provider (Binance spot + USDT perpetual via ccxt.pro internally)",
             factory=build_ccxt_adapter_stub,
-            supports_streaming=False,
-            notes="Streaming is served via CCXT Pro adapter; REST sync deferred.",
-        )
-    )
-    registry.register(
-        ProviderRegistration(
-            provider=Provider.CCXT_PRO,
-            description="CCXT Pro live adapter (Binance spot + USDT perpetual)",
-            factory=build_ccxt_pro_adapter_stub,
             supports_streaming=True,
-            notes="Backed by BinanceLiveAdapter (binance + binanceusdm).",
+            notes="Streaming served by BinanceLiveAdapter (ccxt.pro is internal transport).",
         )
     )
     return registry
