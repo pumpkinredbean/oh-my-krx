@@ -303,6 +303,10 @@ class CollectorDashboardService:
         result = await self._control_plane.delete_target(target_id=target_id)
         return jsonable_encoder(result)
 
+    async def set_provider_enabled(self, *, provider: str, enabled: bool) -> dict[str, Any]:
+        await self._control_plane.set_provider_enabled(provider, enabled)
+        return {"provider": provider, "enabled": enabled}
+
     async def recent_runtime_events(
         self,
         *,
@@ -532,6 +536,31 @@ async def admin_delete_target(target_id: str) -> JSONResponse:
     payload = await dashboard_service.delete_collection_target(target_id=target_id)
     status_code = 404 if payload["status"] == "not_found" else 200
     return JSONResponse(payload, status_code=status_code)
+
+
+_SUPPORTED_PROVIDERS = {"kxt", "ccxt"}
+
+
+@app.post("/admin/providers/{provider}/start")
+async def admin_provider_start(provider: str) -> JSONResponse:
+    if provider not in _SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"unsupported provider: {provider}")
+    try:
+        payload = await dashboard_service.set_provider_enabled(provider=provider, enabled=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(payload)
+
+
+@app.post("/admin/providers/{provider}/stop")
+async def admin_provider_stop(provider: str) -> JSONResponse:
+    if provider not in _SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"unsupported provider: {provider}")
+    try:
+        payload = await dashboard_service.set_provider_enabled(provider=provider, enabled=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(payload)
 
 
 @app.get("/admin/events")

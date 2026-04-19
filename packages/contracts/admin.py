@@ -48,6 +48,26 @@ class SourceCapability:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceRuntimeStatus:
+    """Provider-level logical runtime status row.
+
+    Surfaces ``kxt``/``ccxt`` as first-class logical runtime units in the
+    admin/control-plane snapshot.  The Docker container lifecycle is
+    tracked separately — this row describes whether the provider's
+    publication side is currently enabled and how many of its targets
+    are actively streaming.
+    """
+
+    provider: str
+    state: str
+    enabled: bool
+    active_target_count: int
+    last_error: str | None = None
+    observed_at: datetime | None = None
+    schema_version: str = "v1"
+
+
+@dataclass(frozen=True, slots=True)
 class ControlPlaneSnapshot:
     """API- or Kafka-ready snapshot of the first admin/control-plane surface."""
 
@@ -66,6 +86,9 @@ class ControlPlaneSnapshot:
     # KSXT realtime session-level state (IDLE/CONNECTING/HEALTHY/DEGRADED/CLOSED).
     # Surfaces a separate admin-UI banner from the collector_offline state.
     session_state: str | None = None
+    # Provider-level logical runtime rows (kxt, ccxt).  Additive; does
+    # not replace ``runtime_status``.
+    source_runtime_status: tuple[SourceRuntimeStatus, ...] = ()
     schema_version: str = "v1"
 
 

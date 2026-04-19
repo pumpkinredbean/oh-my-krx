@@ -370,6 +370,20 @@ async def admin_delete_target(target_id: str) -> JSONResponse:
     return await _relay_collector_json("DELETE", f"/admin/targets/{target_id}")
 
 
+@app.post("/api/admin/providers/{provider}/start")
+async def admin_provider_start(provider: str) -> JSONResponse:
+    if provider not in {"kxt", "ccxt"}:
+        return JSONResponse({"error": f"unsupported provider: {provider}"}, status_code=400)
+    return await _relay_collector_json("POST", f"/admin/providers/{provider}/start")
+
+
+@app.post("/api/admin/providers/{provider}/stop")
+async def admin_provider_stop(provider: str) -> JSONResponse:
+    if provider not in {"kxt", "ccxt"}:
+        return JSONResponse({"error": f"unsupported provider: {provider}"}, status_code=400)
+    return await _relay_collector_json("POST", f"/admin/providers/{provider}/stop")
+
+
 @app.get("/api/admin/events")
 async def admin_recent_events(
     target_id: str | None = Query(None),

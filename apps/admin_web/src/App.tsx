@@ -13,6 +13,7 @@ interface InstrumentRef {
   instrument_type?: string | null;
   venue?: string | null;
   asset_class?: string | null;
+  provider?: ProviderId | null;
 }
 
 interface EventCatalogEntry {
@@ -71,6 +72,15 @@ interface RuntimeStatus {
   last_error?: string | null;
 }
 
+interface SourceRuntimeStatus {
+  provider: ProviderId;
+  state: string;
+  enabled: boolean;
+  active_target_count: number;
+  last_error?: string | null;
+  observed_at?: string | null;
+}
+
 interface Snapshot {
   captured_at: string | null;
   source_service: string;
@@ -85,6 +95,8 @@ interface Snapshot {
   container_status?: string;
   /** KSXT realtime session state (IDLE/CONNECTING/HEALTHY/DEGRADED/CLOSED). */
   session_state?: string | null;
+  /** Provider-level logical runtime rows (kxt, ccxt). */
+  source_runtime_status?: SourceRuntimeStatus[];
 }
 
 interface TargetMutationResponse {
@@ -751,6 +763,7 @@ interface CollectorContainerStatus {
 
 function RuntimeView({ snapshot, onRefresh }: { snapshot: Snapshot | null; onRefresh?: () => Promise<void> }) {
   const runtime = snapshot?.runtime_status ?? [];
+  const providerRuntimes = snapshot?.source_runtime_status ?? [];
   const targetStatuses = snapshot?.collection_target_status ?? [];
   const targets = snapshot?.collection_targets ?? [];
 
@@ -758,6 +771,9 @@ function RuntimeView({ snapshot, onRefresh }: { snapshot: Snapshot | null; onRef
   const [containerBusy, setContainerBusy] = useState(false);
   const [containerMsg, setContainerMsg] = useState('');
   const [containerError, setContainerError] = useState(false);
+  const [providerBusy, setProviderBusy] = useState<string>('');
+  const [providerMsg, setProviderMsg] = useState('');
+  const [providerError, setProviderError] = useState(false);
 
   const fetchContainerStatus = useCallback(async () => {
     try {
@@ -795,6 +811,30 @@ function RuntimeView({ snapshot, onRefresh }: { snapshot: Snapshot | null; onRef
       setContainerError(true);
     } finally {
       setContainerBusy(false);
+    }
+  }
+
+  async function doProviderAction(provider: string, action: 'start' | 'stop') {
+    setProviderBusy(`${provider}:${action}`);
+    setProviderMsg('');
+    setProviderError(false);
+    try {
+      const r = await requestJson<{ provider?: string; enabled?: boolean; error?: string }>(
+        `/api/admin/providers/${provider}/${action}`,
+        { method: 'POST' },
+      );
+      if (r.error) {
+        setProviderMsg(r.error);
+        setProviderError(true);
+      } else {
+        setProviderMsg(`${provider.toUpperCase()} ${action === 'start' ? '시작됨' : '정지됨'}`);
+        if (onRefresh) await onRefresh();
+      }
+    } catch (err) {
+      setProviderMsg(err instanceof Error ? err.message : `${action} 실패`);
+      setProviderError(true);
+    } finally {
+      setProviderBusy('');
     }
   }
 
@@ -866,6 +906,78 @@ function RuntimeView({ snapshot, onRefresh }: { snapshot: Snapshot | null; onRef
           </div>
         </div>
         {containerMsg && <Banner msg={containerMsg} error={containerError} />}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <span className="eyebrow">Provider Runtimes</span>
+          <span className="count-pill">{providerRuntimes.length}</span>
+        </div>
+        {providerRuntimes.length === 0 ? (
+          <Empty msg="프로바이더 상태 없음" />
+        ) : (
+          <div className="tbl-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>프로바이더</th>
+                  <th>상태</th>
+                  <th>활성</th>
+                  <th>활성 타깃 수</th>
+                  <th>마지막 오류</th>
+                  <th>관측 시각</th>
+                  <th>작업</th>
+                </tr>
+              </thead>
+              <tbody>
+                {providerRuntimes.map((p) => {
+                  const startKey = `${p.provider}:start`;
+                  const stopKey = `${p.provider}:stop`;
+                  return (
+                    <tr key={p.provider}>
+                      <td>
+                        <strong>{p.provider.toUpperCase()}</strong>
+                      </td>
+                      <td>
+                        <Badge label={p.state} tone={stateTone(p.state)} />
+                      </td>
+                      <td>
+                        <Badge
+                          label={p.enabled ? 'enabled' : 'disabled'}
+                          tone={p.enabled ? 'good' : 'muted'}
+                        />
+                      </td>
+                      <td>{p.active_target_count}</td>
+                      <td className="error-cell">{p.last_error ?? '—'}</td>
+                      <td className="mono">{fmt(p.observed_at ?? null)}</td>
+                      <td>
+                        <div className="row-actions">
+                          <button
+                            type="button"
+                            className="sm-btn"
+                            disabled={providerBusy === startKey || p.enabled}
+                            onClick={() => void doProviderAction(p.provider, 'start')}
+                          >
+                            시작
+                          </button>
+                          <button
+                            type="button"
+                            className="sm-btn danger-sm"
+                            disabled={providerBusy === stopKey || !p.enabled}
+                            onClick={() => void doProviderAction(p.provider, 'stop')}
+                          >
+                            정지
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {providerMsg && <Banner msg={providerMsg} error={providerError} />}
       </section>
 
       <section className="panel">

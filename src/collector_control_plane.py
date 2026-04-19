@@ -13,7 +13,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from packages.contracts.admin import ControlPlaneSnapshot, EventTypeCatalogEntry, RecentRuntimeEvent, SourceCapability
+from packages.contracts.admin import (
+    ControlPlaneSnapshot,
+    EventTypeCatalogEntry,
+    RecentRuntimeEvent,
+    SourceCapability,
+    SourceRuntimeStatus,
+)
 from packages.contracts.events import EventType
 from packages.contracts.topics import DASHBOARD_EVENTS_TOPIC
 from packages.domain.enums import AssetClass, InstrumentType, Provider, RuntimeState, Venue, external_provider_value
@@ -192,6 +198,14 @@ class CollectorControlPlaneService:
         # session-level signals (session_recovered, session_state_changed).
         self._meta_subscribers: list[asyncio.Queue[tuple[str, dict[str, Any]]]] = []
         self._session_state: str | None = None
+        # Provider-level logical runtime control.  Default both first-class
+        # external providers to enabled so current KXT + CCXT behavior is
+        # preserved.  Disabling a provider releases its current
+        # subscriptions via ``_stop_publication`` while keeping the target
+        # rows (and their ``enabled`` attribute) intact so re-enabling can
+        # restart them.
+        self._provider_enabled: dict[str, bool] = {"kxt": True, "ccxt": True}
+        self._provider_errors: dict[str, str | None] = {"kxt": None, "ccxt": None}
 
     async def mark_running(self) -> None:
         async with self._lock:
@@ -206,6 +220,80 @@ class CollectorControlPlaneService:
         async with self._lock:
             self._service_state = RuntimeState.STOPPED
 
+    async def set_provider_enabled(self, provider: str, enabled: bool) -> None:
+        """Enable or disable a provider at the logical runtime layer.
+
+        Disabling releases the provider's current publications via
+        ``_stop_publication`` but keeps the target rows (and their
+        ``enabled`` attribute) intact.  Enabling iterates the stored
+        targets and re-invokes ``_start_publication`` for each target
+        whose ``target.enabled`` is True and whose provider matches.
+
+        Idempotent: calling with the same state is a no-op (aside from
+        clearing any prior recorded provider-level error).  Per-target
+        failures are swallowed and recorded into ``_provider_errors``.
+        """
+
+        provider_key = external_provider_value(provider)
+        if provider_key not in self._provider_enabled:
+            raise ValueError(f"unsupported provider: {provider}")
+
+        async with self._lock:
+            previous = self._provider_enabled.get(provider_key, True)
+            self._provider_enabled[provider_key] = enabled
+            if previous == enabled:
+                # Idempotent fast path — still clear any stale error.
+                self._provider_errors[provider_key] = None
+                return
+            # Snapshot the matching targets under the lock.
+            matching_targets = [
+                target
+                for target in self._targets.values()
+                if external_provider_value(target.provider) == provider_key
+            ]
+            self._provider_errors[provider_key] = None
+
+        last_error: str | None = None
+        if not enabled:
+            for target in matching_targets:
+                try:
+                    await self._stop_publication(subscription_id=target.target_id)
+                except Exception as exc:  # noqa: BLE001 — record & continue
+                    last_error = str(exc)
+        else:
+            for target in matching_targets:
+                if not target.enabled:
+                    continue
+                try:
+                    try:
+                        await self._start_publication(
+                            symbol=target.instrument.symbol,
+                            market_scope=target.market_scope,
+                            owner_id=target.target_id,
+                            event_types=target.event_types,
+                            provider=external_provider_value(target.provider),
+                            instrument_type=(
+                                target.instrument.instrument_type.value
+                                if target.instrument.instrument_type is not None
+                                else None
+                            ),
+                            canonical_symbol=target.canonical_symbol,
+                            raw_symbol=target.instrument.raw_symbol,
+                        )
+                    except TypeError:
+                        await self._start_publication(
+                            symbol=target.instrument.symbol,
+                            market_scope=target.market_scope,
+                            owner_id=target.target_id,
+                            event_types=target.event_types,
+                        )
+                except Exception as exc:  # noqa: BLE001 — record & continue
+                    last_error = str(exc)
+
+        if last_error is not None:
+            async with self._lock:
+                self._provider_errors[provider_key] = last_error
+
     async def snapshot(self) -> ControlPlaneSnapshot:
         async with self._lock:
             targets = tuple(self._targets.values())
@@ -216,6 +304,8 @@ class CollectorControlPlaneService:
             service_error = self._last_service_error
             last_event_at_by_target = dict(self._last_event_at_by_target)
             session_state = self._session_state
+            provider_enabled = dict(self._provider_enabled)
+            provider_errors = dict(self._provider_errors)
 
         statuses = tuple(
             self._build_target_status(
@@ -230,6 +320,35 @@ class CollectorControlPlaneService:
         degraded_error = next((status.last_error for status in statuses if status.last_error), None)
         runtime_state = RuntimeState.DEGRADED if degraded_error else service_state
         runtime_error = degraded_error or service_error
+
+        observed_at = datetime.utcnow()
+        source_runtime_rows: list[SourceRuntimeStatus] = []
+        for provider_name in ("kxt", "ccxt"):
+            provider_targets = [
+                target
+                for target in targets
+                if external_provider_value(target.provider) == provider_name
+            ]
+            active_count = sum(
+                1 for target in provider_targets if self._is_publication_active(target.target_id)
+            )
+            enabled = provider_enabled.get(provider_name, True)
+            if active_count > 0:
+                state = "running"
+            elif not enabled:
+                state = "disabled"
+            else:
+                state = "stopped"
+            source_runtime_rows.append(
+                SourceRuntimeStatus(
+                    provider=provider_name,
+                    state=state,
+                    enabled=enabled,
+                    active_target_count=active_count,
+                    last_error=provider_errors.get(provider_name),
+                    observed_at=observed_at,
+                )
+            )
 
         return ControlPlaneSnapshot(
             captured_at=datetime.utcnow(),
@@ -251,6 +370,7 @@ class CollectorControlPlaneService:
             collection_target_status=statuses,
             source_capabilities=SOURCE_CAPABILITIES,
             session_state=session_state,
+            source_runtime_status=tuple(source_runtime_rows),
         )
 
     async def search_instruments(
@@ -359,29 +479,36 @@ class CollectorControlPlaneService:
                 await self._stop_publication(subscription_id=duplicate_target_id)
 
         apply_error: str | None = None
+        provider_disabled_skip = False
         if enabled:
-            try:
-                await self._start_publication(
-                    symbol=normalized_symbol,
-                    market_scope=resolved_market_scope,
-                    owner_id=resolved_target_id,
-                    event_types=normalized_event_types,
-                    provider=external_provider_value(resolved_provider),
-                    instrument_type=resolved_instrument_type.value if resolved_instrument_type else None,
-                    canonical_symbol=instrument_ref.canonical_symbol,
-                    raw_symbol=instrument_ref.raw_symbol,
-                )
-            except TypeError:
-                # Backwards compatibility with start_publication callbacks that
-                # do not yet accept provider-aware kwargs (e.g. older tests).
-                await self._start_publication(
-                    symbol=normalized_symbol,
-                    market_scope=resolved_market_scope,
-                    owner_id=resolved_target_id,
-                    event_types=normalized_event_types,
-                )
-            except Exception as exc:
-                apply_error = str(exc)
+            # Provider-level gating: when the provider is logically disabled,
+            # persist the target with its enabled flag but do not start
+            # publication.  Re-enabling the provider will restart it.
+            if not self._provider_enabled.get(external_provider_value(resolved_provider), True):
+                provider_disabled_skip = True
+            else:
+                try:
+                    await self._start_publication(
+                        symbol=normalized_symbol,
+                        market_scope=resolved_market_scope,
+                        owner_id=resolved_target_id,
+                        event_types=normalized_event_types,
+                        provider=external_provider_value(resolved_provider),
+                        instrument_type=resolved_instrument_type.value if resolved_instrument_type else None,
+                        canonical_symbol=instrument_ref.canonical_symbol,
+                        raw_symbol=instrument_ref.raw_symbol,
+                    )
+                except TypeError:
+                    # Backwards compatibility with start_publication callbacks that
+                    # do not yet accept provider-aware kwargs (e.g. older tests).
+                    await self._start_publication(
+                        symbol=normalized_symbol,
+                        market_scope=resolved_market_scope,
+                        owner_id=resolved_target_id,
+                        event_types=normalized_event_types,
+                    )
+                except Exception as exc:
+                    apply_error = str(exc)
         else:
             try:
                 await self._stop_publication(subscription_id=resolved_target_id)
@@ -398,6 +525,7 @@ class CollectorControlPlaneService:
             "applied": apply_error is None,
             "warning": apply_error,
             "deduplicated_target_ids": tuple(duplicate_target_ids),
+            "provider_disabled": provider_disabled_skip,
         }
 
     async def delete_target(self, *, target_id: str) -> dict[str, object]:
