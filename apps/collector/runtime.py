@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from kxt import (
     BarTimeframe as KSXTBarTimeframe,
@@ -24,16 +24,7 @@ from kxt import (
     TradeEvent as KSXTTradeEvent,
     Venue as KSXTVenue,
 )
-
-# ``Subscription`` is not part of KXT's public top-level surface (KXT v0.1.x).
-# It is the internal type returned by ``KISRealtimeSession.subscribe(...)`` and
-# is only used here for type annotations.  Import it lazily under
-# ``TYPE_CHECKING`` so we never depend on it at runtime, keeping the hub
-# resilient to KXT's private layout while honoring the read-only KXT contract.
-if TYPE_CHECKING:
-    from kxt.clients.kis.realtime.subscription import Subscription as KSXTSubscription
-else:
-    KSXTSubscription = Any
+from kxt.requests import Subscription as KSXTSubscription
 
 from packages.contracts import EventType
 from packages.domain.enums import AssetClass, InstrumentType, Provider, Venue, external_provider_value

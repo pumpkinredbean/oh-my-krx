@@ -156,3 +156,45 @@ impact so later sessions can branch with full context.
   - 잔존 위험: Binance 가 `markPrice@arr` 틱에서 funding 필드를 누락하는 구간에서는 `funding_rate` 이벤트 payload 필드가 `None` 으로 발행될 수 있음. `BinanceFundingRate` / `poll_funding_rate` 는 미사용이지만 제거하지 않고 남김.
   - `git push` 금지(H6) 는 H21 미해결 조건으로 유지.
   - 상세 리포트: `_vaults/market-data-vault/reviews/ksxt-migration-progress/funding-rate-ws-step7-report.md`.
+
+---
+
+## H31 — KXT PyPI alignment (kxt==0.1.0a4) + private import retired
+
+- **Status**: PASS
+- **Context**: Hub was coupled to local `/Users/minkyu/workspace/kxt` via
+  compose bind-mount + `PYTHONPATH=/app:/opt/kxt/src` override; had one
+  `TYPE_CHECKING`-guarded private import
+  (`kxt.clients.kis.realtime.subscription.Subscription`) per H26.
+- **Action**:
+  - `requirements.txt`: pinned `kxt==0.1.0a4` (latest PyPI prerelease;
+    exact pin so pip accepts the prerelease without `--pre`).
+  - `compose.yaml`: removed `/Users/minkyu/workspace/kxt:/opt/kxt:ro` bind
+    mounts and `/opt/kxt/src` from `PYTHONPATH` on `collector` + `api-web`
+    services (`KXT_KIS_WS_PROXY` env preserved).
+  - `apps/collector/runtime.py`: replaced the private
+    `kxt.clients.kis.realtime.subscription.Subscription` import with the
+    public re-export `from kxt.requests import Subscription as KSXTSubscription`
+    (confirmed in 0.1.0a4 wheel). Dropped the `KSXTSubscription = Any`
+    runtime fallback and the now-unused `TYPE_CHECKING` typing import.
+    Closes H26 residual risk.
+- **검증**:
+  - `python -m pytest tests/ -q` → 64 passed, 181 warnings in 0.89s.
+  - Host import sanity: all 14 top-level symbols + `kxt.requests.Subscription`
+    import cleanly from `site-packages/kxt`.
+  - `docker compose build collector api-web` → both built OK.
+  - In-image runtime probe: `import kxt` resolves to
+    `/usr/local/lib/python3.12/site-packages/kxt/__init__.py` — no
+    `/opt/kxt` dependency remains.
+- **영향 / 잔존**:
+  - `KISClient.fetch_bars(...)` is labeled "legacy compatibility wrapper"
+    upstream — follow-up migration to `get_bars` / `BarsRequest` tracked.
+  - `0.1.0a4` is a prerelease; re-pin when 0.1.x exits alpha.
+  - `kxt.__version__` attribute is not exposed at module level in 0.1.0a4;
+    diagnostics that need the version should use
+    `importlib.metadata.version("kxt")`.
+- **파일**: `requirements.txt`, `compose.yaml`, `apps/collector/runtime.py`.
+- **Branch / commits**: `chore/kxt-pypi-alignment` (off `main`; no `dev`
+  branch existed — deviation noted), commit `77eb5df`, pushed to
+  `origin/chore/kxt-pypi-alignment`.
+- **상세 리포트**: `_vaults/market-data-vault/reviews/ksxt-migration-progress/kxt-pypi-alignment-step-report.md`.

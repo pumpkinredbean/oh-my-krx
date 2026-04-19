@@ -8,3 +8,4 @@ uvicorn>=0.35.0
 aiokafka>=0.10.0
 docker>=7.0.0
 ccxt>=4.4.0
+kxt==0.1.0a4
