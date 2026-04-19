@@ -155,7 +155,7 @@ EVENT_TYPE_DESCRIPTIONS: dict[EventType, str] = {
     EventType.TICKER: "심볼 단위 시세 요약 (best bid/ask + last)",
     EventType.OHLCV: "OHLCV 캔들/바 이벤트",
     EventType.MARK_PRICE: "선물/무기한 마크 프라이스",
-    EventType.FUNDING_RATE: "무기한 펀딩비 (polled every ~30s, near-live)",
+    EventType.FUNDING_RATE: "무기한 펀딩비 (mark-price WS 파생, live)",
     EventType.OPEN_INTEREST: "선물/무기한 미결제약정 (polled every ~30s, near-live)",
 }
 

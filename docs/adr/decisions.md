@@ -136,3 +136,23 @@ impact so later sessions can branch with full context.
   - 다음 세션은 cleanup 종결로 admin UI 확대(SPA bundle 재빌드 포함) 또는 live capability 확장(reconnect/health, 정규장 시나리오 1 재실행 — H21 unblock) 중 선택 가능.
   - `git push` 금지(H6)는 H21 미해결 조건으로 그대로 유지.
   - 잔존 위험: KXT 내부 모듈 경로(`kxt.clients.kis.realtime.subscription`)에 의존하는 import는 런타임 평가는 회피되지만 KXT 내부 구조 변경 시 정적 분석 도구가 깨질 수 있음 — 향후 KXT가 `Subscription`을 public export로 추가하면 `TYPE_CHECKING` 가드를 top-level import로 되돌리는 1줄 정리 권장.
+
+---
+
+## H30 — Funding-rate WS 승격 + shared mark-price 소스 fan-out
+
+- **질문**: Binance perpetual `funding_rate` 를 REST polling 에서 mark-price WS 파생 live 세만틱으로 승격하고, 동일 canonical 에 대해 `mark_price` + `funding_rate` 를 단일 mark-price WS 로 fan-out 할 수 있는가?
+- **결정**: **PASS** — parser/runtime/tests 전면 완료, `python -m pytest tests/ -q` 64 passed (full green), KXT 변경 0건.
+- **근거**:
+  - 파일 변경: `packages/adapters/ccxt.py` (BinanceMarkPrice 확장 + `_parse_ccxt_mark_price` funding 필드 추출), `apps/collector/runtime.py` (`_CryptoMarkPriceSourceEntry` + `_attach/_detach/_run_crypto_mark_price_source` 도입, MP/FR 채널을 shared source 경로로 라우팅, 구 `_crypto_mark_price_stream` / `_crypto_funding_rate_stream` 제거, `_format_crypto_funding_rate_from_mark` 추가, `aclose` 에서 source task 정리), `src/collector_control_plane.py` (FUNDING_RATE 설명 `mark-price WS 파생, live` 로 갱신), `tests/test_multiprovider_step4_capabilities.py` (parser 테스트에 `r`/`T`/`E` 주입 + funding_rate shared-source 재시나리오 + 새 shared-source counter 테스트).
+  - Parser enrichment 키: root `fundingRate` / `nextFundingTimestamp`; info `fundingRate` / `lastFundingRate` / `r` / `T` / `nextFundingTime` / `E`. numeric 문자열 허용, non-numeric 문자열 거부.
+  - Runtime shared source 설계: `canonical_symbol` 단위 ref-count (active_event_names set). 최초 attach 시 1 task 생성, 마지막 detach 시 cancel. 생성/파기 race 는 task 생성 직후 재검증으로 방어.
+  - pytest 결과: `64 passed, 181 warnings in 0.91s` — 신규 `test_mark_price_and_funding_share_single_mark_price_source` 포함하여 shared-source counter 정확히 1 확인.
+  - KXT 변경 0건.
+- **영향**:
+  - `funding_rate` 이제 live WS 파생 — polling 30s 하한 제거, 업스트림 mark-price 틱마다 갱신.
+  - `open_interest` 는 변함없이 polling (30s 하한 유지).
+  - 외부 event 이름/페이로드 contract 유지: `mark_price` payload 는 funding 필드 미노출, `funding_rate` payload 필드명은 기존 `funding_rate` / `funding_timestamp_ms` / `next_funding_timestamp_ms` 동일.
+  - 잔존 위험: Binance 가 `markPrice@arr` 틱에서 funding 필드를 누락하는 구간에서는 `funding_rate` 이벤트 payload 필드가 `None` 으로 발행될 수 있음. `BinanceFundingRate` / `poll_funding_rate` 는 미사용이지만 제거하지 않고 남김.
+  - `git push` 금지(H6) 는 H21 미해결 조건으로 유지.
+  - 상세 리포트: `_vaults/market-data-vault/reviews/ksxt-migration-progress/funding-rate-ws-step7-report.md`.

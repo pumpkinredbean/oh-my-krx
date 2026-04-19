@@ -245,6 +245,9 @@ class BinanceMarkPrice:
     occurred_at: datetime
     mark_price: Decimal | None
     index_price: Decimal | None = None
+    funding_rate: Decimal | None = None
+    funding_timestamp_ms: int | None = None
+    next_funding_timestamp_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,6 +619,58 @@ def _parse_ccxt_mark_price(symbol: str, instrument_type: str, raw: dict[str, Any
         index_raw = raw.get("indexPrice")
     if index_raw is None and isinstance(info, dict):
         index_raw = info.get("indexPrice") or info.get("i")
+
+    # Funding rate extraction: ccxt root then WS info (Binance USD-M fields).
+    funding_rate_raw: Any = None
+    if isinstance(raw, dict):
+        funding_rate_raw = raw.get("fundingRate")
+    if funding_rate_raw is None and isinstance(info, dict):
+        for key in ("fundingRate", "lastFundingRate", "r"):
+            if info.get(key) is not None:
+                funding_rate_raw = info.get(key)
+                break
+
+    def _numeric_ms(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                try:
+                    return int(float(value))
+                except ValueError:
+                    return None
+        return None
+
+    next_funding_ms: int | None = None
+    if isinstance(raw, dict):
+        candidate = raw.get("nextFundingTimestamp")
+        if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+            next_funding_ms = int(candidate)
+    if next_funding_ms is None and isinstance(info, dict):
+        for key in ("T", "nextFundingTime"):
+            if key in info and info.get(key) is not None:
+                next_funding_ms = _numeric_ms(info.get(key))
+                if next_funding_ms is not None:
+                    break
+
+    funding_ts_ms: int | None = None
+    if isinstance(raw, dict):
+        candidate = raw.get("fundingTimestamp")
+        if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+            funding_ts_ms = int(candidate)
+        if funding_ts_ms is None:
+            candidate = raw.get("timestamp")
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                funding_ts_ms = int(candidate)
+    if funding_ts_ms is None and isinstance(info, dict):
+        candidate = info.get("E")
+        if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+            funding_ts_ms = int(candidate)
+
     occurred_at = _timestamp_to_datetime(raw.get("timestamp") if isinstance(raw, dict) else None)
     return BinanceMarkPrice(
         symbol=symbol,
@@ -623,6 +678,9 @@ def _parse_ccxt_mark_price(symbol: str, instrument_type: str, raw: dict[str, Any
         occurred_at=occurred_at,
         mark_price=_to_decimal(mark_raw),
         index_price=_to_decimal(index_raw),
+        funding_rate=_to_decimal(funding_rate_raw),
+        funding_timestamp_ms=funding_ts_ms,
+        next_funding_timestamp_ms=next_funding_ms,
     )
 
 

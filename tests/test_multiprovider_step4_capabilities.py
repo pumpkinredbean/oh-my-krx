@@ -131,7 +131,13 @@ class AdapterCapabilityParserTests(unittest.IsolatedAsyncioTestCase):
         fake = _FakeExchange(mark_price={
             "symbol": "BTC/USDT:USDT",
             "timestamp": 1700000000000,
-            "info": {"markPrice": "100123.45", "indexPrice": "100100.10"},
+            "info": {
+                "markPrice": "100123.45",
+                "indexPrice": "100100.10",
+                "r": "0.00012",
+                "T": "1700028800000",
+                "E": 1700000000000,
+            },
         })
 
         async def _ex(_it):
@@ -146,6 +152,9 @@ class AdapterCapabilityParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.instrument_type, "perpetual")
         self.assertEqual(event.mark_price, Decimal("100123.45"))
         self.assertEqual(event.index_price, Decimal("100100.10"))
+        self.assertEqual(event.funding_rate, Decimal("0.00012"))
+        self.assertEqual(event.next_funding_timestamp_ms, 1700028800000)
+        self.assertEqual(event.funding_timestamp_ms, 1700000000000)
 
     async def test_poll_funding_rate_parses(self) -> None:
         from packages.adapters.ccxt import BinanceFundingRate, BinanceLiveAdapter
@@ -378,12 +387,14 @@ class RuntimeCapabilityDispatchTests(unittest.IsolatedAsyncioTestCase):
             await runtime.aclose()
 
     async def test_perpetual_funding_and_open_interest_traverse_runtime(self) -> None:
-        from packages.adapters.ccxt import BinanceFundingRate, BinanceOpenInterest
+        from packages.adapters.ccxt import BinanceMarkPrice, BinanceOpenInterest
 
-        fr = BinanceFundingRate(
+        mark_with_funding_fields = BinanceMarkPrice(
             symbol="BTC/USDT:USDT",
             instrument_type="perpetual",
             occurred_at=datetime.now(timezone.utc),
+            mark_price=Decimal("100123.45"),
+            index_price=Decimal("100100.10"),
             funding_rate=Decimal("0.0001"),
             funding_timestamp_ms=1700000000000,
             next_funding_timestamp_ms=1700028800000,
@@ -396,7 +407,7 @@ class RuntimeCapabilityDispatchTests(unittest.IsolatedAsyncioTestCase):
             open_interest_value=Decimal("1234567890"),
         )
         runtime, captured = await self._runtime_with_events(
-            {"funding_rate": [fr], "open_interest": [oi]}
+            {"mark_price": [mark_with_funding_fields], "open_interest": [oi]}
         )
         try:
             await runtime.register_target(
@@ -412,7 +423,86 @@ class RuntimeCapabilityDispatchTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(fr_ev)
             self.assertIsNotNone(oi_ev)
             self.assertEqual(fr_ev["instrument_type"], "perpetual")
+            self.assertEqual(fr_ev["payload"]["funding_rate"], float(Decimal("0.0001")))
+            self.assertEqual(fr_ev["payload"]["next_funding_timestamp_ms"], 1700028800000)
             self.assertEqual(oi_ev["instrument_type"], "perpetual")
+        finally:
+            await runtime.aclose()
+
+    async def test_mark_price_and_funding_share_single_mark_price_source(self) -> None:
+        from apps.collector.runtime import CollectorRuntime
+        from packages.adapters.ccxt import BinanceMarkPrice
+
+        mark_with_funding_fields = BinanceMarkPrice(
+            symbol="BTC/USDT:USDT",
+            instrument_type="perpetual",
+            occurred_at=datetime.now(timezone.utc),
+            mark_price=Decimal("100123.45"),
+            index_price=Decimal("100100.10"),
+            funding_rate=Decimal("0.0001"),
+            funding_timestamp_ms=1700000000000,
+            next_funding_timestamp_ms=1700028800000,
+        )
+
+        captured: list[dict[str, Any]] = []
+
+        async def on_event(**kwargs):
+            captured.append(kwargs)
+
+        runtime = CollectorRuntime(
+            SimpleNamespace(app_key="k", app_secret="s"),
+            on_event=on_event,
+        )
+
+        async def _noop_wait(**_):
+            return None
+
+        runtime._wait_session_ready = _noop_wait  # type: ignore[assignment]
+
+        stream_call_count = {"n": 0}
+
+        class _CountingAdapter:
+            adapter_id = "fake"
+
+            def __init__(self):
+                self.closed = False
+
+            async def stream_mark_price(self, *, symbol, instrument_type):  # noqa: ARG002
+                stream_call_count["n"] += 1
+                yield mark_with_funding_fields
+                await asyncio.sleep(10)
+
+            async def aclose(self):
+                self.closed = True
+
+        runtime._crypto_adapter = _CountingAdapter()  # type: ignore[assignment]
+        try:
+            await runtime.register_target(
+                owner_id="t-share-1",
+                symbol="BTCUSDT",
+                market_scope="",
+                event_types=("mark_price", "funding_rate"),
+                provider="ccxt",
+                instrument_type="perpetual",
+            )
+            mp_ev = await self._wait_for_event(captured, "mark_price")
+            fr_ev = await self._wait_for_event(captured, "funding_rate")
+            self.assertIsNotNone(mp_ev)
+            self.assertIsNotNone(fr_ev)
+            self.assertEqual(stream_call_count["n"], 1)
+
+            # Second owner asking only for funding_rate on same canonical must reuse.
+            await runtime.register_target(
+                owner_id="t-share-2",
+                symbol="BTCUSDT",
+                market_scope="",
+                event_types=("funding_rate",),
+                provider="ccxt",
+                instrument_type="perpetual",
+            )
+            # Give the runtime a moment to potentially start another source.
+            await asyncio.sleep(0.05)
+            self.assertEqual(stream_call_count["n"], 1)
         finally:
             await runtime.aclose()
 

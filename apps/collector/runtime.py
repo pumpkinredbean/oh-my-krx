@@ -136,6 +136,16 @@ class _CryptoChannelEntry:
     provider: Provider
 
 
+@dataclass(slots=True)
+class _CryptoMarkPriceSourceEntry:
+    canonical_symbol: str
+    symbol: str
+    instrument_type: InstrumentType
+    provider: Provider
+    task: asyncio.Task[None] | None
+    active_event_names: set[str]
+
+
 def _decimal_to_float(value: Any) -> float:
     try:
         return float(value) if value is not None else 0.0
@@ -313,6 +323,19 @@ def _format_crypto_mark_price(event: BinanceMarkPrice) -> tuple[str, dict[str, A
     return _EVENT_MARK_PRICE, payload
 
 
+def _format_crypto_funding_rate_from_mark(event: BinanceMarkPrice) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "symbol": event.symbol,
+        "instrument_type": event.instrument_type,
+        "occurred_at": _utc_iso(event.occurred_at),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "funding_rate": _number(event.funding_rate),
+        "funding_timestamp_ms": event.funding_timestamp_ms,
+        "next_funding_timestamp_ms": event.next_funding_timestamp_ms,
+    }
+    return _EVENT_FUNDING_RATE, payload
+
+
 def _format_crypto_funding_rate(event: BinanceFundingRate) -> tuple[str, dict[str, Any]]:
     payload = {
         "symbol": event.symbol,
@@ -385,6 +408,7 @@ class CollectorRuntime:
         self._registrations_by_owner: dict[str, RuntimeTargetRegistration] = {}
         self._channels: dict[_ChannelKey, _ChannelEntry] = {}
         self._crypto_channels: dict[_CryptoChannelKey, _CryptoChannelEntry] = {}
+        self._crypto_mark_sources: dict[str, _CryptoMarkPriceSourceEntry] = {}
         self._crypto_adapter: BinanceLiveAdapter | None = None
         self._closed = False
 
@@ -395,8 +419,10 @@ class CollectorRuntime:
         async with self._lock:
             channels = tuple(self._channels.values())
             crypto_channels = tuple(self._crypto_channels.values())
+            crypto_mark_sources = tuple(self._crypto_mark_sources.values())
             self._channels.clear()
             self._crypto_channels.clear()
+            self._crypto_mark_sources.clear()
             self._registrations_by_owner.clear()
             crypto_adapter = self._crypto_adapter
             self._crypto_adapter = None
@@ -423,6 +449,13 @@ class CollectorRuntime:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+
+        for source_entry in crypto_mark_sources:
+            source_task = source_entry.task
+            if source_task is not None:
+                source_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await source_task
 
         if crypto_adapter is not None:
             with contextlib.suppress(Exception):
@@ -872,6 +905,25 @@ class CollectorRuntime:
         if already_running:
             return
 
+        if channel_key.event_name in (_EVENT_MARK_PRICE, _EVENT_FUNDING_RATE):
+            if instrument_type != InstrumentType.PERPETUAL:
+                logger.warning(
+                    "crypto event_type=%s requires perpetual; skipping (instrument_type=%s)",
+                    channel_key.event_name,
+                    instrument_type.value,
+                )
+                async with self._lock:
+                    self._crypto_channels.pop(channel_key, None)
+                return
+            await self._attach_crypto_mark_price_source(
+                canonical_symbol=channel_key.canonical_symbol,
+                event_name=channel_key.event_name,
+                symbol=symbol,
+                instrument_type=instrument_type,
+                provider=provider,
+            )
+            return
+
         if channel_key.event_name == _EVENT_TRADE:
             stream_factory = self._crypto_trade_stream
         elif channel_key.event_name == _EVENT_ORDER_BOOK:
@@ -880,28 +932,6 @@ class CollectorRuntime:
             stream_factory = self._crypto_ticker_stream
         elif channel_key.event_name == _EVENT_OHLCV:
             stream_factory = self._crypto_ohlcv_stream
-        elif channel_key.event_name == _EVENT_MARK_PRICE:
-            if instrument_type != InstrumentType.PERPETUAL:
-                logger.warning(
-                    "crypto event_type=%s requires perpetual; skipping (instrument_type=%s)",
-                    channel_key.event_name,
-                    instrument_type.value,
-                )
-                async with self._lock:
-                    self._crypto_channels.pop(channel_key, None)
-                return
-            stream_factory = self._crypto_mark_price_stream
-        elif channel_key.event_name == _EVENT_FUNDING_RATE:
-            if instrument_type != InstrumentType.PERPETUAL:
-                logger.warning(
-                    "crypto event_type=%s requires perpetual; skipping (instrument_type=%s)",
-                    channel_key.event_name,
-                    instrument_type.value,
-                )
-                async with self._lock:
-                    self._crypto_channels.pop(channel_key, None)
-                return
-            stream_factory = self._crypto_funding_rate_stream
         elif channel_key.event_name == _EVENT_OPEN_INTEREST:
             if instrument_type != InstrumentType.PERPETUAL:
                 logger.warning(
@@ -952,19 +982,32 @@ class CollectorRuntime:
         *,
         owner_id: str,
     ) -> None:
+        entry_instrument_type: InstrumentType | None = None
         async with self._lock:
             entry = self._crypto_channels.get(channel_key)
             if entry is None:
-                return
-            entry.owners.discard(owner_id)
-            if entry.owners:
-                return
-            self._crypto_channels.pop(channel_key, None)
-            task = entry.task
+                # Might be an MP/FR channel served by the shared source
+                # whose channel record was discarded because no per-channel
+                # task was ever started. In that case just proceed to detach.
+                entry_instrument_type = None
+                task = None
+            else:
+                entry.owners.discard(owner_id)
+                if entry.owners:
+                    return
+                self._crypto_channels.pop(channel_key, None)
+                task = entry.task
+                entry_instrument_type = entry.instrument_type
         if task is not None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        if channel_key.event_name in (_EVENT_MARK_PRICE, _EVENT_FUNDING_RATE) and (
+            entry_instrument_type is None or entry_instrument_type == InstrumentType.PERPETUAL
+        ):
+            await self._detach_crypto_mark_price_source(
+                channel_key.canonical_symbol, channel_key.event_name
+            )
 
     def _crypto_trade_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
         return adapter.stream_trades(symbol=symbol, instrument_type=instrument_type)
@@ -977,12 +1020,6 @@ class CollectorRuntime:
 
     def _crypto_ohlcv_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
         return adapter.stream_ohlcv(symbol=symbol, instrument_type=instrument_type)
-
-    def _crypto_mark_price_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
-        return adapter.stream_mark_price(symbol=symbol, instrument_type=instrument_type)
-
-    def _crypto_funding_rate_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
-        return adapter.poll_funding_rate(symbol=symbol, instrument_type=instrument_type)
 
     def _crypto_open_interest_stream(self, adapter: BinanceLiveAdapter, *, symbol: str, instrument_type: InstrumentType):
         return adapter.poll_open_interest(symbol=symbol, instrument_type=instrument_type)
@@ -1011,12 +1048,6 @@ class CollectorRuntime:
                 elif isinstance(event, BinanceBar):
                     published_event_name, payload = _format_crypto_bar(event)
                     canonical_event_name = _EVENT_OHLCV
-                elif isinstance(event, BinanceMarkPrice):
-                    published_event_name, payload = _format_crypto_mark_price(event)
-                    canonical_event_name = _EVENT_MARK_PRICE
-                elif isinstance(event, BinanceFundingRate):
-                    published_event_name, payload = _format_crypto_funding_rate(event)
-                    canonical_event_name = _EVENT_FUNDING_RATE
                 elif isinstance(event, BinanceOpenInterest):
                     published_event_name, payload = _format_crypto_open_interest(event)
                     canonical_event_name = _EVENT_OPEN_INTEREST
@@ -1041,6 +1072,112 @@ class CollectorRuntime:
             logger.exception("crypto subscription consumer crashed: %s", channel_key)
             await self._dispatch_failure(
                 _ChannelKey(symbol=symbol, market_scope="", event_name=channel_key.event_name),
+                error=str(exc),
+            )
+
+    # ---- crypto shared mark-price source -------------------------------
+
+    async def _attach_crypto_mark_price_source(
+        self,
+        *,
+        canonical_symbol: str,
+        event_name: str,
+        symbol: str,
+        instrument_type: InstrumentType,
+        provider: Provider,
+    ) -> None:
+        async with self._lock:
+            source = self._crypto_mark_sources.get(canonical_symbol)
+            if source is None:
+                source = _CryptoMarkPriceSourceEntry(
+                    canonical_symbol=canonical_symbol,
+                    symbol=symbol,
+                    instrument_type=instrument_type,
+                    provider=provider,
+                    task=None,
+                    active_event_names=set(),
+                )
+                self._crypto_mark_sources[canonical_symbol] = source
+            source.active_event_names.add(event_name)
+            needs_start = source.task is None
+        if needs_start:
+            adapter = self._ensure_crypto_adapter()
+            task = asyncio.create_task(
+                self._run_crypto_mark_price_source(canonical_symbol, adapter),
+                name=f"ccxt-pro-mark-source-{canonical_symbol}",
+            )
+            async with self._lock:
+                current = self._crypto_mark_sources.get(canonical_symbol)
+                if current is not None and current.task is None:
+                    current.task = task
+                else:
+                    # Source was torn down between checks; stop the fresh task.
+                    task.cancel()
+            logger.info(
+                "ccxt.pro shared mark-price source started canonical=%s symbol=%s instrument_type=%s event=%s",
+                canonical_symbol, symbol, instrument_type.value, event_name,
+            )
+
+    async def _detach_crypto_mark_price_source(self, canonical_symbol: str, event_name: str) -> None:
+        task_to_cancel: asyncio.Task[None] | None = None
+        async with self._lock:
+            source = self._crypto_mark_sources.get(canonical_symbol)
+            if source is None:
+                return
+            source.active_event_names.discard(event_name)
+            if not source.active_event_names:
+                task_to_cancel = source.task
+                self._crypto_mark_sources.pop(canonical_symbol, None)
+        if task_to_cancel is not None:
+            task_to_cancel.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task_to_cancel
+
+    async def _run_crypto_mark_price_source(self, canonical_symbol: str, adapter: BinanceLiveAdapter) -> None:
+        async with self._lock:
+            source = self._crypto_mark_sources.get(canonical_symbol)
+            if source is None:
+                return
+            symbol = source.symbol
+            instrument_type = source.instrument_type
+            provider = source.provider
+        try:
+            async for event in adapter.stream_mark_price(symbol=symbol, instrument_type=instrument_type):
+                async with self._lock:
+                    source = self._crypto_mark_sources.get(canonical_symbol)
+                    active = set(source.active_event_names) if source is not None else set()
+                if not active:
+                    continue
+                if _EVENT_MARK_PRICE in active:
+                    published_event_name, payload = _format_crypto_mark_price(event)
+                    await self._publish_event(
+                        symbol=symbol,
+                        market_scope="",
+                        event_name=published_event_name,
+                        payload=payload,
+                        provider=external_provider_value(provider),
+                        canonical_symbol=canonical_symbol,
+                        instrument_type=instrument_type.value,
+                        raw_symbol=symbol,
+                    )
+                if _EVENT_FUNDING_RATE in active:
+                    published_event_name, payload = _format_crypto_funding_rate_from_mark(event)
+                    await self._publish_event(
+                        symbol=symbol,
+                        market_scope="",
+                        event_name=published_event_name,
+                        payload=payload,
+                        provider=external_provider_value(provider),
+                        canonical_symbol=canonical_symbol,
+                        instrument_type=instrument_type.value,
+                        raw_symbol=symbol,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("crypto mark-price source crashed: %s", canonical_symbol)
+            await self._dispatch_failure(
+                _ChannelKey(symbol=symbol, market_scope="", event_name=_EVENT_MARK_PRICE),
                 error=str(exc),
             )
 
