@@ -116,4 +116,23 @@ impact so later sessions can branch with full context.
   - `git push` 금지(H6) 는 H21 미해결 조건으로 그대로 유지.
   - 다음 세션은 (1) 정규장 시간대 시나리오 1 재실행 (H21 unblock), (2) admin SPA bundle 재빌드 (`src/web/admin_dist/assets/index-*.js`는 step3 이전 UI를 인코딩한 stale 상태 — frontend 변경은 source-only), (3) kxt v0.1.0의 `Subscription` public export 추가 (apps.collector.runtime import 차단 해결) 중 선택 가능.
   - 잔존 위험: KXT 내부 `instrument_type` 기본값을 `EQUITY`→`SPOT`으로 변경했으나 asset_class는 그대로 `EQUITY`. in-repo 다운스트림 소비자에 영향 없음.
-  - 본 결정 리포트는 권한 제한으로 vault에 직접 작성 불가 — repo-local `docs/adr/multiprovider-identity-ui-step3-report.md`에 기록되었으며 vault 측 mirror는 별도 운영자 작업으로 미룬다.
+  - 본 결정 리포트는 권한 제한으로 vault에 직접 작성 불가 — repo-local `docs/adr/multiprovider-identity-ui-step3-report.md`에 기록되었으며 vault 측 mirror는 별도 운영자 작업으로 미룬다. (mirror는 H26 cleanup 세션에서 완료됨.)
+
+---
+
+## H26 — Cleanup: vault artifact sync + KXT import 환경 정리 결과
+
+- **질문**: vault artifact sync + KXT import 환경 정리 결과
+- **결정**: **PASS** — canonical vault에 step3 report mirror 완료, canonical decisions에 H25/H26 반영 완료, `python -m pytest tests/ -q` 44 passed (full green), KXT 변경 0건.
+- **근거**:
+  - canonical artifact sync: `_vaults/market-data-vault/reviews/ksxt-migration-progress/multiprovider-identity-ui-step3-report.md` 신규 생성 (repo-local과 byte-identical, `diff -q` MATCH).
+  - H25 canonical 반영: 기존 vault `decisions.md`에 부재 → 본 세션에서 H25 + H26 append. H25/H26 각 1회 등장.
+  - 실패 11건 root cause: `apps/collector/runtime.py:11-27`의 `from kxt import (... Subscription as KSXTSubscription, ...)`가 KXT v0.1.x public top-level surface에 부재 → `ImportError: cannot import name 'Subscription' from 'kxt'`. 11 failures 모두 동일 import-time 실패의 collection-time 전파.
+  - 사용처는 type annotation 전용 2개 (`_ChannelEntry.subscription` line 102, `_consume_subscription` line 672 시그니처) — 런타임 동작 의존 0건.
+  - hub-only minimum fix: top-level `Subscription` import 제거. `from __future__ import annotations`로 annotation lazy 평가되므로 `TYPE_CHECKING` 가드 하 `from kxt.clients.kis.realtime.subscription import Subscription as KSXTSubscription`, 런타임은 `KSXTSubscription = Any`. KXT 0건 변경 제약 준수.
+  - 검증: `python -m pytest tests/ -q` → 44 passed; `python -c "import apps.collector.runtime; import src.collector_control_plane"` → ok.
+  - 상세 cleanup report: `_vaults/market-data-vault/reviews/ksxt-migration-progress/multiprovider-cleanup-step4-report.md`.
+- **영향**:
+  - 다음 세션은 cleanup 종결로 admin UI 확대(SPA bundle 재빌드 포함) 또는 live capability 확장(reconnect/health, 정규장 시나리오 1 재실행 — H21 unblock) 중 선택 가능.
+  - `git push` 금지(H6)는 H21 미해결 조건으로 그대로 유지.
+  - 잔존 위험: KXT 내부 모듈 경로(`kxt.clients.kis.realtime.subscription`)에 의존하는 import는 런타임 평가는 회피되지만 KXT 내부 구조 변경 시 정적 분석 도구가 깨질 수 있음 — 향후 KXT가 `Subscription`을 public export로 추가하면 `TYPE_CHECKING` 가드를 top-level import로 되돌리는 1줄 정리 권장.
