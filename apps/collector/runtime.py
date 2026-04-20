@@ -197,6 +197,87 @@ def _format_order_book_event(event: KSXTOrderBookEvent | KSXTOrderBookSnapshot) 
     return "order_book", payload
 
 
+def _enum_value(value: Any) -> Any:
+    """Return the ``.value`` of an enum-like object; pass strings through unchanged."""
+
+    if value is None:
+        return None
+    inner = getattr(value, "value", None)
+    return inner if inner is not None else value
+
+
+def _instrument_ref_to_dict(instrument: Any) -> dict[str, Any] | None:
+    """Serialize a KXT InstrumentRef into a plain dict (DTO field names preserved)."""
+
+    if instrument is None:
+        return None
+    return {
+        "symbol": getattr(instrument, "symbol", None),
+        "venue": _enum_value(getattr(instrument, "venue", None)),
+        "market_segment": _enum_value(getattr(instrument, "market_segment", None)),
+        "instrument_id": getattr(instrument, "instrument_id", None),
+        "name": getattr(instrument, "name", None),
+        "isin": getattr(instrument, "isin", None),
+        "asset_class": _enum_value(getattr(instrument, "asset_class", None)),
+        "instrument_type": _enum_value(getattr(instrument, "instrument_type", None)),
+    }
+
+
+def _isoformat_utc(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _kxt_trade_event_dto_payload(event: KSXTTradeEvent | KSXTTrade) -> dict[str, Any]:
+    """KXT TradeEvent/Trade serialized using KXT DTO field names (no Korean keys)."""
+
+    payload: dict[str, Any] = {
+        "instrument": _instrument_ref_to_dict(getattr(event, "instrument", None)),
+        "occurred_at": _isoformat_utc(event.occurred_at),
+        "price": _number(getattr(event, "price", None)),
+        "quantity": _number(getattr(event, "quantity", None)),
+        "side": _enum_value(getattr(event, "side", None)),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Trade-specific optional fields (when serialising KSXTTrade rather than TradeEvent)
+    for optional_field in ("trade_id", "sequence"):
+        if hasattr(event, optional_field):
+            value = getattr(event, optional_field)
+            if value is not None:
+                payload[optional_field] = value
+    for optional_decimal in ("ask_price", "bid_price"):
+        if hasattr(event, optional_decimal):
+            value = getattr(event, optional_decimal)
+            if value is not None:
+                payload[optional_decimal] = _number(value)
+    return payload
+
+
+def _kxt_order_book_event_dto_payload(
+    event: KSXTOrderBookEvent | KSXTOrderBookSnapshot,
+) -> dict[str, Any]:
+    """KXT OrderBookEvent/Snapshot serialized using KXT DTO field names."""
+
+    asks = [
+        {"price": _number(level.price), "quantity": _number(level.quantity)}
+        for level in getattr(event, "asks", ()) or ()
+    ]
+    bids = [
+        {"price": _number(level.price), "quantity": _number(level.quantity)}
+        for level in getattr(event, "bids", ()) or ()
+    ]
+    return {
+        "instrument": _instrument_ref_to_dict(getattr(event, "instrument", None)),
+        "occurred_at": _isoformat_utc(event.occurred_at),
+        "asks": asks,
+        "bids": bids,
+        "total_ask_quantity": _number(getattr(event, "total_ask_quantity", None)),
+        "total_bid_quantity": _number(getattr(event, "total_bid_quantity", None)),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _format_market_bars(bars: tuple[KSXTMarketBar, ...]) -> list[dict[str, Any]]:
     """Format KSXT MarketBar tuple into dashboard candle dicts (shape-only)."""
 
@@ -808,9 +889,11 @@ class CollectorRuntime:
                 try:
                     if isinstance(event, (KSXTTradeEvent, KSXTTrade)):
                         published_event_name, payload = _format_trade_event(event)
+                        dto_payload = _kxt_trade_event_dto_payload(event)
                         event_name_canonical = _EVENT_TRADE
                     elif isinstance(event, (KSXTOrderBookEvent, KSXTOrderBookSnapshot)):
                         published_event_name, payload = _format_order_book_event(event)
+                        dto_payload = _kxt_order_book_event_dto_payload(event)
                         event_name_canonical = _EVENT_ORDER_BOOK
                     else:
                         logger.debug("dropping unknown KSXT event type: %r", type(event))
@@ -823,6 +906,7 @@ class CollectorRuntime:
                         market_scope=channel_key.market_scope,
                         event_name=published_event_name,
                         payload=payload,
+                        control_plane_payload=dto_payload,
                     )
                 except Exception:
                     logger.exception("failed to publish event for %s", channel_key)
@@ -1275,6 +1359,7 @@ class CollectorRuntime:
         canonical_symbol: str | None = None,
         instrument_type: str | None = None,
         raw_symbol: str | None = None,
+        control_plane_payload: dict[str, Any] | None = None,
     ) -> None:
         if self._on_event is None:
             return
@@ -1288,17 +1373,33 @@ class CollectorRuntime:
                 canonical_symbol=canonical_symbol,
                 instrument_type=instrument_type,
                 raw_symbol=raw_symbol,
+                control_plane_payload=control_plane_payload,
             )
         except TypeError:
-            # Backwards-compat: legacy on_event handlers (KXT-only) accept
-            # only (symbol, market_scope, event_name, payload).
+            # Handler does not know about ``control_plane_payload`` yet — retry
+            # with the pre-DTO kwarg signature.
             try:
                 await self._on_event(
                     symbol=symbol,
                     market_scope=market_scope,
                     event_name=event_name,
                     payload=payload,
+                    provider=provider,
+                    canonical_symbol=canonical_symbol,
+                    instrument_type=instrument_type,
+                    raw_symbol=raw_symbol,
                 )
+            except TypeError:
+                # Legacy KXT-only handler: only (symbol, market_scope, event_name, payload).
+                try:
+                    await self._on_event(
+                        symbol=symbol,
+                        market_scope=market_scope,
+                        event_name=event_name,
+                        payload=payload,
+                    )
+                except Exception:
+                    logger.exception("on_event handler failed for %s/%s", symbol, event_name)
             except Exception:
                 logger.exception("on_event handler failed for %s/%s", symbol, event_name)
         except Exception:

@@ -377,6 +377,7 @@ class CollectorDashboardService:
         canonical_symbol: str | None = None,
         instrument_type: str | None = None,
         raw_symbol: str | None = None,
+        control_plane_payload: dict[str, Any] | None = None,
     ) -> None:
         # Externalise provider at the boundary so neither Kafka envelopes
         # nor the recent-event buffer ever expose ccxt_pro.
@@ -395,7 +396,7 @@ class CollectorDashboardService:
             symbol=symbol,
             market_scope=market_scope,
             event_name=event_name,
-            payload=payload,
+            payload=control_plane_payload if control_plane_payload is not None else payload,
             provider=external_provider,
             canonical_symbol=canonical_symbol,
             instrument_type=instrument_type,

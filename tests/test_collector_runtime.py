@@ -535,5 +535,202 @@ class PermanentFailureLoggingReservedKeyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(getattr(rec, "failure_msg"), "delisted")
 
 
+# ---------------------------------------------------------------------------
+# KXT DTO payload for admin Events page (hub-KXT-DTO)
+# ---------------------------------------------------------------------------
+
+
+class KxtDtoSerializerTests(unittest.TestCase):
+    """DTO serializers produce KXT field names (no Korean keys)."""
+
+    def _make_instrument(self):
+        from kxt import InstrumentRef as KSXTInstrumentRef, Venue as KSXTVenue
+
+        return KSXTInstrumentRef(symbol="005930", venue=KSXTVenue.KRX)
+
+    def test_trade_event_dto_payload_shape(self) -> None:
+        from apps.collector.runtime import _kxt_trade_event_dto_payload
+        from kxt import TradeEvent as KSXTTradeEvent
+
+        occurred = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        event = KSXTTradeEvent(
+            occurred_at=occurred,
+            instrument=self._make_instrument(),
+            price=Decimal("71000"),
+            quantity=Decimal("10"),
+            side=None,
+        )
+
+        dto = _kxt_trade_event_dto_payload(event)
+
+        self.assertIn("instrument", dto)
+        self.assertIn("occurred_at", dto)
+        self.assertIn("price", dto)
+        self.assertIn("quantity", dto)
+        self.assertIn("side", dto)
+        self.assertEqual(dto["instrument"]["symbol"], "005930")
+        self.assertEqual(dto["price"], 71000)
+        self.assertEqual(dto["quantity"], 10)
+        self.assertIsInstance(dto["occurred_at"], str)
+        datetime.fromisoformat(dto["occurred_at"])
+        for key in dto.keys():
+            for forbidden in ("체결", "호가", "잔량", "현재가"):
+                self.assertNotIn(forbidden, key)
+
+    def test_order_book_event_dto_payload_shape(self) -> None:
+        from apps.collector.runtime import _kxt_order_book_event_dto_payload
+        from kxt import OrderBookEvent as KSXTOrderBookEvent
+        from kxt.models.market_data import QuoteLevel
+
+        occurred = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        event = KSXTOrderBookEvent(
+            occurred_at=occurred,
+            instrument=self._make_instrument(),
+            asks=(
+                QuoteLevel(price=Decimal("71100"), quantity=Decimal("5")),
+                QuoteLevel(price=Decimal("71200"), quantity=Decimal("7")),
+            ),
+            bids=(
+                QuoteLevel(price=Decimal("71000"), quantity=Decimal("4")),
+                QuoteLevel(price=Decimal("70900"), quantity=Decimal("3")),
+            ),
+            total_ask_quantity=Decimal("12"),
+            total_bid_quantity=Decimal("7"),
+        )
+
+        dto = _kxt_order_book_event_dto_payload(event)
+
+        self.assertEqual(dto["instrument"]["symbol"], "005930")
+        self.assertIsInstance(dto["asks"], list)
+        self.assertEqual(len(dto["asks"]), 2)
+        self.assertEqual(dto["asks"][0], {"price": 71100, "quantity": 5})
+        self.assertEqual(dto["bids"][0], {"price": 71000, "quantity": 4})
+        self.assertEqual(dto["total_ask_quantity"], 12)
+        self.assertEqual(dto["total_bid_quantity"], 7)
+        for key in dto.keys():
+            for forbidden in ("체결", "호가", "잔량", "현재가"):
+                self.assertNotIn(forbidden, key)
+
+
+class HandleRuntimeEventRoutingTests(unittest.IsolatedAsyncioTestCase):
+    """Service routes Korean payload to dashboard publisher and DTO to control plane."""
+
+    async def test_routes_korean_to_publisher_and_dto_to_control_plane(self) -> None:
+        from apps.collector.service import CollectorDashboardService
+
+        publisher = SimpleNamespace(publish_dashboard_event=mock.AsyncMock())
+        control_plane = SimpleNamespace(record_runtime_event=mock.AsyncMock())
+        service = SimpleNamespace(_publisher=publisher, _control_plane=control_plane)
+
+        korean_payload = {"체결시각": "03:04:05", "현재가": 71000}
+        dto_payload = {
+            "instrument": {"symbol": "005930", "venue": "KRX"},
+            "occurred_at": "2026-01-02T03:04:05+00:00",
+            "price": 71000,
+            "quantity": 10,
+            "side": None,
+        }
+
+        await CollectorDashboardService._handle_runtime_event(
+            service,  # type: ignore[arg-type]
+            symbol="005930",
+            market_scope="krx",
+            event_name="trade_price",
+            payload=korean_payload,
+            control_plane_payload=dto_payload,
+        )
+
+        publisher.publish_dashboard_event.assert_awaited_once()
+        pub_kwargs = publisher.publish_dashboard_event.call_args.kwargs
+        self.assertIs(pub_kwargs["payload"], korean_payload)
+
+        control_plane.record_runtime_event.assert_awaited_once()
+        cp_kwargs = control_plane.record_runtime_event.call_args.kwargs
+        self.assertIs(cp_kwargs["payload"], dto_payload)
+
+    async def test_routing_falls_back_to_korean_when_no_dto_given(self) -> None:
+        from apps.collector.service import CollectorDashboardService
+
+        publisher = SimpleNamespace(publish_dashboard_event=mock.AsyncMock())
+        control_plane = SimpleNamespace(record_runtime_event=mock.AsyncMock())
+        service = SimpleNamespace(_publisher=publisher, _control_plane=control_plane)
+
+        korean_payload = {"체결시각": "03:04:05", "현재가": 71000}
+
+        await CollectorDashboardService._handle_runtime_event(
+            service,  # type: ignore[arg-type]
+            symbol="005930",
+            market_scope="krx",
+            event_name="trade_price",
+            payload=korean_payload,
+        )
+
+        cp_kwargs = control_plane.record_runtime_event.call_args.kwargs
+        self.assertIs(cp_kwargs["payload"], korean_payload)
+
+
+class PublishEventLegacyHandlerCompatTests(unittest.IsolatedAsyncioTestCase):
+    """``_publish_event`` must tolerate handlers without ``control_plane_payload``."""
+
+    async def test_legacy_handler_without_control_plane_payload_still_invoked(self) -> None:
+        from apps.collector.runtime import CollectorRuntime
+
+        seen: list[dict] = []
+
+        async def legacy_handler(
+            *,
+            symbol: str,
+            market_scope: str,
+            event_name: str,
+            payload: dict,
+            provider=None,
+            canonical_symbol=None,
+            instrument_type=None,
+            raw_symbol=None,
+        ) -> None:
+            seen.append(
+                {
+                    "symbol": symbol,
+                    "event_name": event_name,
+                    "payload": payload,
+                }
+            )
+
+        runtime = SimpleNamespace(_on_event=legacy_handler)
+
+        await CollectorRuntime._publish_event(
+            runtime,  # type: ignore[arg-type]
+            symbol="005930",
+            market_scope="krx",
+            event_name="trade_price",
+            payload={"체결시각": "x"},
+            control_plane_payload={"instrument": {"symbol": "005930"}},
+        )
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["payload"], {"체결시각": "x"})
+
+    async def test_minimal_4arg_handler_is_still_invoked(self) -> None:
+        from apps.collector.runtime import CollectorRuntime
+
+        seen: list[dict] = []
+
+        async def minimal_handler(*, symbol, market_scope, event_name, payload):
+            seen.append(payload)
+
+        runtime = SimpleNamespace(_on_event=minimal_handler)
+
+        await CollectorRuntime._publish_event(
+            runtime,  # type: ignore[arg-type]
+            symbol="005930",
+            market_scope="krx",
+            event_name="trade_price",
+            payload={"체결시각": "x"},
+            control_plane_payload={"instrument": {"symbol": "005930"}},
+        )
+
+        self.assertEqual(seen, [{"체결시각": "x"}])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
