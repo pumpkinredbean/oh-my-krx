@@ -898,22 +898,77 @@ async def admin_charts_errors() -> JSONResponse:
     return JSONResponse({"instances": await indicator_runtime_manager.instance_states()})
 
 
+# Event names for which a raw runtime event is forwarded over
+# /admin/charts/stream as a named SSE `raw_event` frame. The candle
+# panels in the admin charts view consume this directly so they render
+# from the real raw OHLCV feed rather than from a synthesized series.
+_ADMIN_CHARTS_RAW_EVENT_NAMES: frozenset[str] = frozenset({"ohlcv", "trade"})
+
+
+def _format_admin_charts_raw_event_frame(event: Any) -> str:
+    """Format a ``RecentRuntimeEvent`` as a ``raw_event`` SSE frame.
+
+    Exposed at module scope so focused tests can assert the wire shape
+    without spinning up the full SSE generator.
+    """
+    payload = dict(getattr(event, "payload", {}) or {})
+    published_at = getattr(event, "published_at", None)
+    # The raw OHLCV/trade payloads carry their own ``occurred_at`` which
+    # the frontend prefers as the candle timestamp. Copy it up to
+    # ``timestamp`` so the admin UI can read a single canonical field.
+    timestamp = payload.get("occurred_at") or payload.get("timestamp")
+    data = {
+        "symbol": getattr(event, "symbol", None),
+        "event_name": getattr(event, "event_name", None),
+        "timestamp": timestamp,
+        "published_at": published_at,
+        "payload": payload,
+    }
+    return f"event: raw_event\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
 @app.get("/admin/charts/stream")
 async def admin_charts_stream(request: Request) -> StreamingResponse:
     async def event_generator() -> Any:
         yield "event: connected\ndata: {}\n\n"
         try:
-            async with indicator_runtime_manager.subscribe_indicator_output() as queue:
+            async with indicator_runtime_manager.subscribe_indicator_output() as indicator_queue, \
+                    dashboard_service.subscribe_events() as raw_queue:
                 while True:
                     if await request.is_disconnected():
                         return
+                    indicator_task = asyncio.create_task(indicator_queue.get())
+                    raw_task = asyncio.create_task(raw_queue.get())
                     try:
-                        envelope = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    except asyncio.TimeoutError:
+                        done, _ = await asyncio.wait(
+                            {indicator_task, raw_task},
+                            timeout=15.0,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    except asyncio.CancelledError:
+                        indicator_task.cancel()
+                        raw_task.cancel()
+                        raise
+
+                    if not done:
+                        indicator_task.cancel()
+                        raw_task.cancel()
                         yield ": keepalive\n\n"
                         continue
-                    data = jsonable_encoder(envelope)
-                    yield f"event: indicator_output\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+                    if indicator_task in done:
+                        envelope = indicator_task.result()
+                        data = jsonable_encoder(envelope)
+                        yield f"event: indicator_output\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                    else:
+                        indicator_task.cancel()
+
+                    if raw_task in done:
+                        raw_event = raw_task.result()
+                        if raw_event.event_name in _ADMIN_CHARTS_RAW_EVENT_NAMES:
+                            yield _format_admin_charts_raw_event_frame(raw_event)
+                    else:
+                        raw_task.cancel()
         except Exception as exc:  # noqa: BLE001
             yield f"event: upstream_error\ndata: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
 

@@ -224,7 +224,7 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
 
   // Indicator output buffer (keyed by instance_id), bounded per series.
   const [indicatorOutputs, setIndicatorOutputs] = useState<Map<string, SeriesPoint[]>>(new Map());
-  const [rawEvents] = useState<Map<string, unknown[]>>(new Map());
+  const [rawEvents, setRawEvents] = useState<Map<string, unknown[]>>(() => new Map());
 
   // Script editor state.
   const [editingScriptId, setEditingScriptId] = useState<string | null>(null);
@@ -267,6 +267,39 @@ export default function ChartsView({ capabilities, targets }: ChartsViewProps) {
           const key = payload.instance_id;
           const cur = next.get(key) ?? [];
           const merged = [...cur, payload.point].slice(-500);
+          next.set(key, merged);
+          return next;
+        });
+      } catch {
+        // ignore
+      }
+    });
+    es.addEventListener('raw_event', (evt: MessageEvent) => {
+      try {
+        const envelope = JSON.parse(evt.data) as {
+          symbol?: string;
+          event_name?: string;
+          timestamp?: string | number | null;
+          published_at?: string | number | null;
+          payload?: Record<string, unknown> | null;
+        };
+        const symbol = envelope.symbol;
+        const eventName = envelope.event_name;
+        if (!symbol || !eventName) return;
+        const key = `${symbol}:${eventName}`;
+        // Flatten payload onto the row so ChartPanel can read OHLCV
+        // fields (r.open, r.high, …) directly alongside timestamp.
+        const row = {
+          ...(envelope.payload ?? {}),
+          symbol,
+          event_name: eventName,
+          timestamp: envelope.timestamp,
+          published_at: envelope.published_at,
+        } as Record<string, unknown>;
+        setRawEvents((prev) => {
+          const next = new Map(prev);
+          const cur = next.get(key) ?? [];
+          const merged = [...cur, row].slice(-500);
           next.set(key, merged);
           return next;
         });
