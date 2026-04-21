@@ -754,3 +754,47 @@ tr.payload-row td {
   gap: 10px;
   flex-wrap: wrap;
 }
+
+/* ── Charts View ─────────────────────────────────────────────────── */
+.charts-view .react-grid-layout {
+  position: relative;
+  min-height: 400px;
+}
+.charts-view .chart-wrapper {
+  background: #111418;
+  border: 1px solid #2a2f38;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: #d0d0d0;
+}
+.charts-view .chart-wrapper-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 8px;
+  background: #1a1d22;
+  border-bottom: 1px solid #2a2f38;
+  cursor: move;
+  font-size: 12px;
+  gap: 8px;
+}
+.charts-view .chart-wrapper-head select {
+  font-size: 11px;
+  padding: 1px 4px;
+}
+.charts-view .chart-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+}
+.charts-view .script-editor {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.charts-view .react-resizable-handle {
+  z-index: 5;
+}

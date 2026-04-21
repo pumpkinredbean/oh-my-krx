@@ -1,6 +1,8 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom';
 
+import ChartsView from './views/ChartsView';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type MarketScope = 'krx' | 'nxt' | 'total';
@@ -1513,6 +1515,9 @@ export default function App() {
           <NavLink to="/events" className={({ isActive }) => `nav-btn${isActive ? ' active' : ''}`}>
             Events
           </NavLink>
+          <NavLink to="/charts" className={({ isActive }) => `nav-btn${isActive ? ' active' : ''}`}>
+            Charts
+          </NavLink>
         </nav>
 
         <main className="main">
@@ -1530,6 +1535,28 @@ export default function App() {
             />
             <Route path="runtime" element={<RuntimeView snapshot={snapshot} onRefresh={refreshSnapshot} />} />
             <Route path="events" element={<EventsView snapshot={snapshot} />} />
+            <Route
+              path="charts"
+              element={
+                <ChartsView
+                  capabilities={(snapshot?.source_capabilities ?? []).map((c) => ({
+                    provider: c.provider,
+                    venue: c.venue,
+                    instrument_type: c.instrument_type,
+                    supported_event_types: c.supported_event_types,
+                    label: c.label,
+                  }))}
+                  targets={(snapshot?.collection_targets ?? []).map((t) => ({
+                    target_id: t.target_id,
+                    instrument: {
+                      symbol: t.instrument.symbol,
+                      instrument_type: t.instrument.instrument_type,
+                    },
+                    provider: t.provider,
+                  }))}
+                />
+              }
+            />
             <Route path="*" element={<Navigate to="/targets" replace />} />
           </Routes>
         </main>

@@ -467,6 +467,86 @@ async def admin_events_stream(
     )
 
 
+# ─── Admin Charts relay routes (step 1) ──────────────────────────────────
+
+
+@app.get("/api/admin/charts/panels")
+async def admin_charts_list_panels_relay() -> JSONResponse:
+    return await _relay_collector_json("GET", "/admin/charts/panels")
+
+
+@app.put("/api/admin/charts/panels")
+async def admin_charts_upsert_panel_relay(request: Request) -> JSONResponse:
+    return await _relay_collector_json("PUT", "/admin/charts/panels", json_payload=await request.json())
+
+
+@app.delete("/api/admin/charts/panels/{panel_id}")
+async def admin_charts_delete_panel_relay(panel_id: str) -> JSONResponse:
+    return await _relay_collector_json("DELETE", f"/admin/charts/panels/{panel_id}")
+
+
+@app.get("/api/admin/charts/scripts")
+async def admin_charts_list_scripts_relay() -> JSONResponse:
+    return await _relay_collector_json("GET", "/admin/charts/scripts")
+
+
+@app.put("/api/admin/charts/scripts")
+async def admin_charts_upsert_script_relay(request: Request) -> JSONResponse:
+    return await _relay_collector_json("PUT", "/admin/charts/scripts", json_payload=await request.json())
+
+
+@app.delete("/api/admin/charts/scripts/{script_id}")
+async def admin_charts_delete_script_relay(script_id: str) -> JSONResponse:
+    return await _relay_collector_json("DELETE", f"/admin/charts/scripts/{script_id}")
+
+
+@app.get("/api/admin/charts/instances")
+async def admin_charts_list_instances_relay() -> JSONResponse:
+    return await _relay_collector_json("GET", "/admin/charts/instances")
+
+
+@app.put("/api/admin/charts/instances")
+async def admin_charts_upsert_instance_relay(request: Request) -> JSONResponse:
+    return await _relay_collector_json("PUT", "/admin/charts/instances", json_payload=await request.json())
+
+
+@app.delete("/api/admin/charts/instances/{instance_id}")
+async def admin_charts_delete_instance_relay(instance_id: str) -> JSONResponse:
+    return await _relay_collector_json("DELETE", f"/admin/charts/instances/{instance_id}")
+
+
+@app.get("/api/admin/charts/errors")
+async def admin_charts_errors_relay() -> JSONResponse:
+    return await _relay_collector_json("GET", "/admin/charts/errors")
+
+
+@app.get("/api/admin/charts/stream")
+async def admin_charts_stream_relay(request: Request) -> StreamingResponse:
+    async def event_generator() -> Any:
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "GET",
+                    f"{collector_base_url}/admin/charts/stream",
+                    timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_text():
+                        if await request.is_disconnected():
+                            return
+                        if chunk:
+                            yield chunk
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": f"collector charts stream relay failed: {exc}"}
+            yield f"event: upstream_error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/stream")
 async def stream(
     request: Request,

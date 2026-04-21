@@ -69,6 +69,11 @@ from pydantic import BaseModel
 from apps.collector.publisher import CollectorPublisher
 from apps.collector.runtime import CollectorRuntime, SUPPORTED_MARKET_SCOPES
 from packages.adapters import build_default_registry
+from packages.contracts.admin import (
+    ChartPanelSpec,
+    IndicatorInstanceSpec,
+    IndicatorScriptSpec,
+)
 from packages.contracts.events import EventType
 from packages.contracts.topics import DASHBOARD_CONTROL_TOPIC
 from packages.domain.enums import Provider, external_provider_value
@@ -76,6 +81,16 @@ from packages.infrastructure.kafka import AsyncKafkaJsonBroker
 from packages.shared.config import load_service_settings
 from src.collector_control_plane import CollectorControlPlaneService
 from src.config import settings as kis_settings
+from src.indicator_runtime import (
+    BUILTIN_SCRIPTS,
+    ChartsStateStore,
+    IndicatorRuntimeManager,
+    ScriptValidationError,
+    new_instance_id,
+    new_panel_id,
+    new_script_id,
+    validate_and_instantiate,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -477,6 +492,12 @@ def _all_dashboard_event_types() -> tuple[str, ...]:
 app = FastAPI(title="Collector Service")
 service_settings = load_service_settings("collector")
 dashboard_service = CollectorDashboardService(service_settings)
+charts_state_store = ChartsStateStore()
+charts_state_store.load()
+indicator_runtime_manager = IndicatorRuntimeManager(
+    control_plane=dashboard_service._control_plane,  # noqa: SLF001 - intentional
+    state_store=charts_state_store,
+)
 
 
 @app.get("/health")
@@ -708,12 +729,199 @@ async def admin_events_stream(
 
 @app.on_event("shutdown")
 async def shutdown_runtime() -> None:
+    await indicator_runtime_manager.aclose()
     await dashboard_service.aclose()
 
 
 @app.on_event("startup")
 async def startup_runtime() -> None:
     await dashboard_service.start()
+    await indicator_runtime_manager.start()
+
+
+# ─── Admin Charts + Indicator Runtime (step 1) ────────────────────────────
+
+
+def _panels_payload() -> Any:
+    return [jsonable_encoder(p) for p in charts_state_store._panels.values()]  # noqa: SLF001
+
+
+def _scripts_payload() -> Any:
+    return [jsonable_encoder(s) for s in charts_state_store._scripts.values()]  # noqa: SLF001
+
+
+def _instances_payload() -> Any:
+    return [jsonable_encoder(i) for i in charts_state_store._instances.values()]  # noqa: SLF001
+
+
+@app.get("/admin/charts/panels")
+async def admin_charts_list_panels() -> JSONResponse:
+    panels = await charts_state_store.list_panels()
+    return JSONResponse({"panels": [jsonable_encoder(p) for p in panels]})
+
+
+@app.put("/admin/charts/panels")
+async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
+    body = await request.json()
+    try:
+        panel_id = (body.get("panel_id") or "").strip() or new_panel_id()
+        spec = ChartPanelSpec(
+            panel_id=panel_id,
+            chart_type=str(body.get("chart_type") or "line"),
+            symbol=str(body.get("symbol") or "").strip(),
+            source=str(body.get("source") or "raw_event"),
+            series_ref=str(body.get("series_ref") or ""),
+            x=int(body.get("x") or 0),
+            y=int(body.get("y") or 0),
+            w=int(body.get("w") or 6),
+            h=int(body.get("h") or 6),
+            title=body.get("title"),
+            notes=body.get("notes"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid panel: {exc}") from exc
+    if spec.chart_type not in {"line", "candle"}:
+        raise HTTPException(status_code=400, detail="chart_type must be 'line' or 'candle'")
+    saved = await charts_state_store.upsert_panel(spec)
+    return JSONResponse({"panel": jsonable_encoder(saved)})
+
+
+@app.delete("/admin/charts/panels/{panel_id}")
+async def admin_charts_delete_panel(panel_id: str) -> JSONResponse:
+    removed = await charts_state_store.delete_panel(panel_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="panel not found")
+    return JSONResponse({"panel_id": panel_id, "status": "deleted"})
+
+
+@app.get("/admin/charts/scripts")
+async def admin_charts_list_scripts() -> JSONResponse:
+    scripts = await charts_state_store.list_scripts()
+    return JSONResponse({"scripts": [jsonable_encoder(s) for s in scripts]})
+
+
+@app.put("/admin/charts/scripts")
+async def admin_charts_upsert_script(request: Request) -> JSONResponse:
+    body = await request.json()
+    script_id = (body.get("script_id") or "").strip() or new_script_id()
+    name = str(body.get("name") or "").strip() or script_id
+    source = str(body.get("source") or "")
+    class_name = str(body.get("class_name") or "").strip()
+    description = body.get("description")
+
+    if script_id.startswith("builtin."):
+        raise HTTPException(status_code=400, detail="cannot overwrite built-in scripts")
+
+    # Validation + dry-run.
+    try:
+        _, resolved_class = validate_and_instantiate(
+            source,
+            class_name=class_name or None,
+            params={},
+        )
+    except ScriptValidationError as exc:
+        return JSONResponse(
+            {"error": "validation_failed", "errors": exc.errors},
+            status_code=422,
+        )
+
+    spec = IndicatorScriptSpec(
+        script_id=script_id,
+        name=name,
+        source=source,
+        class_name=resolved_class,
+        builtin=False,
+        description=description if isinstance(description, str) else None,
+    )
+    saved = await charts_state_store.upsert_script(spec)
+    return JSONResponse({"script": jsonable_encoder(saved)})
+
+
+@app.delete("/admin/charts/scripts/{script_id}")
+async def admin_charts_delete_script(script_id: str) -> JSONResponse:
+    if script_id.startswith("builtin."):
+        raise HTTPException(status_code=400, detail="cannot delete built-in scripts")
+    removed = await charts_state_store.delete_script(script_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="script not found")
+    await indicator_runtime_manager.reconcile()
+    return JSONResponse({"script_id": script_id, "status": "deleted"})
+
+
+@app.get("/admin/charts/instances")
+async def admin_charts_list_instances() -> JSONResponse:
+    instances = await charts_state_store.list_instances()
+    return JSONResponse({"instances": [jsonable_encoder(i) for i in instances]})
+
+
+@app.put("/admin/charts/instances")
+async def admin_charts_upsert_instance(request: Request) -> JSONResponse:
+    body = await request.json()
+    instance_id = (body.get("instance_id") or "").strip() or new_instance_id()
+    script_id = (body.get("script_id") or "").strip()
+    if not script_id:
+        raise HTTPException(status_code=400, detail="script_id is required")
+    scripts = {s.script_id: s for s in await charts_state_store.list_scripts()}
+    if script_id not in scripts:
+        raise HTTPException(status_code=400, detail=f"unknown script_id: {script_id}")
+
+    symbol = str(body.get("symbol") or "").strip()
+    market_scope = str(body.get("market_scope") or "").strip().lower()
+    raw_params = body.get("params") or {}
+    params = raw_params if isinstance(raw_params, dict) else {}
+    enabled = bool(body.get("enabled", True))
+
+    spec = IndicatorInstanceSpec(
+        instance_id=instance_id,
+        script_id=script_id,
+        symbol=symbol,
+        market_scope=market_scope,
+        params=params,
+        enabled=enabled,
+    )
+    saved = await charts_state_store.upsert_instance(spec)
+    await indicator_runtime_manager.reconcile()
+    return JSONResponse({"instance": jsonable_encoder(saved)})
+
+
+@app.delete("/admin/charts/instances/{instance_id}")
+async def admin_charts_delete_instance(instance_id: str) -> JSONResponse:
+    removed = await charts_state_store.delete_instance(instance_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="instance not found")
+    await indicator_runtime_manager.reconcile()
+    return JSONResponse({"instance_id": instance_id, "status": "deleted"})
+
+
+@app.get("/admin/charts/errors")
+async def admin_charts_errors() -> JSONResponse:
+    return JSONResponse({"instances": await indicator_runtime_manager.instance_states()})
+
+
+@app.get("/admin/charts/stream")
+async def admin_charts_stream(request: Request) -> StreamingResponse:
+    async def event_generator() -> Any:
+        yield "event: connected\ndata: {}\n\n"
+        try:
+            async with indicator_runtime_manager.subscribe_indicator_output() as queue:
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    try:
+                        envelope = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    data = jsonable_encoder(envelope)
+                    yield f"event: indicator_output\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+        except Exception as exc:  # noqa: BLE001
+            yield f"event: upstream_error\ndata: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/dashboard/subscriptions")

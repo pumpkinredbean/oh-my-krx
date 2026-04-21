@@ -116,3 +116,93 @@ class RecentRuntimeEvent:
     canonical_symbol: str | None = None
     instrument_type: str | None = None
     raw_symbol: str | None = None
+
+
+# ─── Admin Charts + Indicator Runtime (step 1) ─────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesPoint:
+    """Single series datum emitted by an indicator.
+
+    ``timestamp`` is an ISO-8601 UTC string (no timezone suffix required;
+    the receiver interprets it as UTC).  ``value`` is a plain number.
+    ``meta`` is an optional dict for per-point annotations (e.g. the
+    top-N used for an OBI computation); it must be JSON-serialisable.
+    """
+
+    timestamp: str
+    value: float
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ChartPanelSpec:
+    """Admin-UI persisted panel descriptor.
+
+    Layout fields (``x``, ``y``, ``w``, ``h``) are integers in a 12-column
+    grid, matching ``react-grid-layout`` semantics.  ``chart_type`` is
+    ``"line"`` or ``"candle"``.  ``source`` selects the input stream
+    (``"raw_event"`` or ``"indicator_output"``).  ``series_ref`` is a
+    lightweight opaque string used by the frontend to bind the panel to
+    a specific series (event_name for raw, or indicator_instance_id for
+    indicator output).
+    """
+
+    panel_id: str
+    chart_type: str
+    symbol: str
+    source: str
+    series_ref: str
+    x: int = 0
+    y: int = 0
+    w: int = 6
+    h: int = 6
+    title: str | None = None
+    notes: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorScriptSpec:
+    """Persisted user-authored indicator script.
+
+    ``source`` is raw Python text that defines exactly one subclass of
+    ``HubIndicator``.  ``class_name`` records which top-level class the
+    runtime should instantiate.  ``builtin`` is true for indicators
+    shipped with the hub (e.g. ``obi``) whose source is pinned and
+    whose validation step is skipped.
+    """
+
+    script_id: str
+    name: str
+    source: str
+    class_name: str
+    builtin: bool = False
+    description: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorInstanceSpec:
+    """Runtime activation record for one indicator on one symbol."""
+
+    instance_id: str
+    script_id: str
+    symbol: str
+    market_scope: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+    enabled: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorOutputEnvelope:
+    """Fan-out envelope emitted by the indicator runtime."""
+
+    instance_id: str
+    script_id: str
+    name: str
+    symbol: str
+    market_scope: str
+    output_kind: str
+    published_at: datetime
+    point: SeriesPoint
+    schema_version: str = "v1"
