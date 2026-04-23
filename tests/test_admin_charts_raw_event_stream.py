@@ -51,6 +51,33 @@ class FormatRawEventFrameTests(unittest.TestCase):
         self.assertEqual(data["payload"]["volume"], 12.5)
         self.assertEqual(data["payload"]["timeframe"], "1m")
 
+    def test_crypto_trade_raw_frame_cannot_sample_korean_display_fields(self) -> None:
+        from packages.contracts.admin import RecentRuntimeEvent
+        from apps.collector.service import _format_admin_charts_raw_event_frame
+
+        event = RecentRuntimeEvent(
+            event_id="e2",
+            topic_name="t",
+            event_name="trade",
+            symbol="BTC/USDT",
+            market_scope="",
+            published_at=datetime(2026, 4, 21, 12, 0, 0),
+            provider="ccxt",
+            payload={
+                "event_name": "trade",
+                "provider": "ccxt",
+                "occurred_at": "2026-04-21T12:00:00+00:00",
+                "normalized": {"price": 100.0, "quantity": 0.01},
+                "raw": {"id": "t1", "info": {"foo": "bar"}},
+            },
+        )
+        frame = _format_admin_charts_raw_event_frame(event)
+        for forbidden in ("체결", "호가", "잔량", "현재가", "거래량", "매수", "매도"):
+            self.assertNotIn(forbidden, frame)
+        data_line = next(line for line in frame.split("\n") if line.startswith("data: "))
+        data = json.loads(data_line[len("data: "):])
+        self.assertEqual(data["payload"]["raw"]["info"]["foo"], "bar")
+
 
 class AdminChartsStreamRealFanOutTests(unittest.IsolatedAsyncioTestCase):
     """End-to-end via the real control-plane subscribe_events() fan-out.

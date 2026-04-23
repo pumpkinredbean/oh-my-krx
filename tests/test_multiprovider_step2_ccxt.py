@@ -16,6 +16,25 @@ from typing import Any
 from unittest import mock
 
 
+_FORBIDDEN_KOREAN = (
+    "체결",
+    "호가",
+    "잔량",
+    "현재가",
+    "거래량",
+    "매수",
+    "매도",
+)
+
+
+def _stringified(value: Any) -> str:
+    if isinstance(value, dict):
+        return " ".join(f"{_stringified(k)} {_stringified(v)}" for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return " ".join(_stringified(v) for v in value)
+    return str(value)
+
+
 class CCXTSymbolNormalisationTests(unittest.TestCase):
     def test_spot_unified_symbol_from_concat(self) -> None:
         from packages.adapters.ccxt import to_unified_symbol
@@ -97,6 +116,7 @@ class RuntimeCryptoBranchTests(unittest.IsolatedAsyncioTestCase):
             side="buy",
             occurred_at=datetime.now(timezone.utc),
             trade_id="t1",
+            raw={"id": "t1", "price": "100000", "amount": "0.01", "info": {"foo": "bar"}},
         )
         runtime, events = await self._build_runtime_with_fake_adapter([trade], [])
         try:
@@ -133,6 +153,50 @@ class RuntimeCryptoBranchTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("ccxt_pro", ev["canonical_symbol"])
             self.assertEqual(ev["instrument_type"], "spot")
             self.assertIn("raw_symbol", ev)
+            control_payload = ev["control_plane_payload"]
+            self.assertEqual(control_payload["raw"]["info"]["foo"], "bar")
+            for forbidden in _FORBIDDEN_KOREAN:
+                self.assertNotIn(forbidden, _stringified(control_payload))
+        finally:
+            await runtime.aclose()
+
+    async def test_runtime_emits_raw_only_control_payload_for_crypto_order_book(self) -> None:
+        from packages.adapters.ccxt import BinanceOrderBookSnapshot
+
+        raw_book = {
+            "timestamp": 1710000000000,
+            "asks": [["101", "2"]],
+            "bids": [["100", "3"]],
+            "info": {"foo": "book"},
+        }
+        book = BinanceOrderBookSnapshot(
+            symbol="BTC/USDT",
+            occurred_at=datetime.now(timezone.utc),
+            asks=((Decimal("101"), Decimal("2")),),
+            bids=((Decimal("100"), Decimal("3")),),
+            raw=raw_book,
+        )
+        runtime, events = await self._build_runtime_with_fake_adapter([], [book])
+        try:
+            await runtime.register_target(
+                owner_id="ob-spot",
+                symbol="BTCUSDT",
+                market_scope="",
+                event_types=("order_book_snapshot",),
+                provider="ccxt",
+                instrument_type="spot",
+            )
+            for _ in range(50):
+                if events:
+                    break
+                await asyncio.sleep(0.02)
+
+            self.assertTrue(events, "expected at least one order book event")
+            control_payload = events[0]["control_plane_payload"]
+            self.assertEqual(control_payload["raw"]["info"]["foo"], "book")
+            self.assertEqual(control_payload["normalized"]["asks"], [[101, 2]])
+            for forbidden in _FORBIDDEN_KOREAN:
+                self.assertNotIn(forbidden, _stringified(control_payload))
         finally:
             await runtime.aclose()
 
@@ -246,6 +310,40 @@ class ControlPlaneCryptoMatchingTests(unittest.IsolatedAsyncioTestCase):
         # External provider value must collapse ccxt_pro → ccxt.
         self.assertEqual(ev.provider, "ccxt")
         self.assertNotEqual(ev.provider, "ccxt_pro")
+
+
+class CCXTRawPreservationTests(unittest.TestCase):
+    def test_parse_methods_preserve_raw_payloads(self) -> None:
+        from packages.adapters import ccxt as ccxt_adapter
+
+        trade_raw = {"id": "1", "timestamp": 1710000000000, "price": "10", "amount": "2", "info": {"foo": "trade"}}
+        trade = ccxt_adapter._parse_ccxt_trade("BTC/USDT", trade_raw)
+        self.assertIs(trade.raw, trade_raw)
+        self.assertEqual(trade.raw["info"]["foo"], "trade")
+
+        book_raw = {"timestamp": 1710000000000, "asks": [["11", "1"]], "bids": [["10", "2"]], "info": {"foo": "book"}}
+        book = ccxt_adapter._parse_ccxt_order_book("BTC/USDT", book_raw, 10)
+        self.assertIs(book.raw, book_raw)
+
+        ticker_raw = {"timestamp": 1710000000000, "last": "10", "info": {"foo": "ticker"}}
+        ticker = ccxt_adapter._parse_ccxt_ticker("BTC/USDT", "spot", ticker_raw)
+        self.assertIs(ticker.raw, ticker_raw)
+
+        ohlcv_raw = [1710000000000, "1", "2", "0.5", "1.5", "99"]
+        bar = ccxt_adapter._parse_ccxt_ohlcv_bar("BTC/USDT", "spot", "1m", ohlcv_raw)
+        self.assertIs(bar.raw, ohlcv_raw)
+
+        mark_raw = {"timestamp": 1710000000000, "markPrice": "10", "info": {"foo": "mark"}}
+        mark = ccxt_adapter._parse_ccxt_mark_price("BTC/USDT:USDT", "perpetual", mark_raw)
+        self.assertIs(mark.raw, mark_raw)
+
+        funding_raw = {"timestamp": 1710000000000, "fundingRate": "0.01", "info": {"foo": "funding"}}
+        funding = ccxt_adapter._parse_ccxt_funding_rate("BTC/USDT:USDT", "perpetual", funding_raw)
+        self.assertIs(funding.raw, funding_raw)
+
+        oi_raw = {"timestamp": 1710000000000, "openInterest": "123", "info": {"foo": "oi"}}
+        open_interest = ccxt_adapter._parse_ccxt_open_interest("BTC/USDT:USDT", "perpetual", oi_raw)
+        self.assertIs(open_interest.raw, oi_raw)
 
 
 if __name__ == "__main__":  # pragma: no cover

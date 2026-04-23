@@ -143,6 +143,48 @@ class SessionRecoveryPropagationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events_snapshot["recent_events"], ())
 
 
+class CollectorServiceCryptoFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_crypto_runtime_event_without_control_payload_does_not_record_display_payload(self) -> None:
+        from apps.collector.service import CollectorDashboardService
+
+        published: list[dict[str, object]] = []
+        recorded: list[dict[str, object]] = []
+
+        class _Publisher:
+            async def publish_dashboard_event(self, **kwargs: object) -> None:
+                published.append(kwargs)
+
+        class _ControlPlane:
+            async def record_runtime_event(self, **kwargs: object) -> None:
+                recorded.append(kwargs)
+
+        service = object.__new__(CollectorDashboardService)
+        service._publisher = _Publisher()  # type: ignore[attr-defined]
+        service._control_plane = _ControlPlane()  # type: ignore[attr-defined]
+
+        display_payload = {"체결시각": "12:00:00", "현재가": 100, "거래량": 1}
+        await CollectorDashboardService._handle_runtime_event(
+            service,  # type: ignore[arg-type]
+            symbol="BTC/USDT",
+            market_scope="",
+            event_name="trade_price",
+            payload=display_payload,
+            provider="ccxt",
+            canonical_symbol="ccxt:binance:crypto:spot:BTC/USDT",
+            instrument_type="spot",
+            raw_symbol="BTCUSDT",
+            control_plane_payload=None,
+        )
+
+        self.assertEqual(published[0]["payload"], display_payload)
+        self.assertNotEqual(recorded[0]["payload"], display_payload)
+        self.assertEqual(recorded[0]["payload"], {
+            "provider": "ccxt",
+            "payload_unavailable": True,
+            "reason": "missing_crypto_control_plane_payload",
+        })
+
+
 # ---------------------------------------------------------------------------
 # hub-E new contract tests
 # ---------------------------------------------------------------------------

@@ -433,6 +433,91 @@ def _format_crypto_open_interest(event: BinanceOpenInterest) -> tuple[str, dict[
     return _EVENT_OPEN_INTEREST, payload
 
 
+def _crypto_raw_control_plane_payload(
+    *,
+    event_name: str,
+    event: Any,
+    normalized: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the Binance/CCXT admin payload from raw provider data only.
+
+    The dashboard payload may retain legacy display keys for compatibility,
+    but admin Events/control-plane/charts must not receive those display
+    fields.  This payload preserves the CCXT object under ``raw`` and keeps a
+    small English-key normalized summary for matching/debugging.
+    """
+
+    return {
+        "event_name": event_name,
+        "provider": "ccxt",
+        "venue": "binance",
+        "symbol": getattr(event, "symbol", None),
+        "instrument_type": getattr(event, "instrument_type", None),
+        "occurred_at": _utc_iso(getattr(event, "occurred_at")),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "normalized": normalized,
+        "raw": getattr(event, "raw", None),
+    }
+
+
+def _crypto_trade_control_plane_payload(event: BinanceTrade) -> dict[str, Any]:
+    return _crypto_raw_control_plane_payload(
+        event_name=_EVENT_TRADE,
+        event=event,
+        normalized={
+            "symbol": event.symbol,
+            "price": _number(event.price),
+            "quantity": _number(event.quantity),
+            "side": event.side,
+            "trade_id": event.trade_id,
+            "occurred_at": _utc_iso(event.occurred_at),
+        },
+    )
+
+
+def _crypto_order_book_control_plane_payload(event: BinanceOrderBookSnapshot) -> dict[str, Any]:
+    return _crypto_raw_control_plane_payload(
+        event_name=_EVENT_ORDER_BOOK,
+        event=event,
+        normalized={
+            "symbol": event.symbol,
+            "occurred_at": _utc_iso(event.occurred_at),
+            "asks": [[_number(price), _number(quantity)] for price, quantity in event.asks[:10]],
+            "bids": [[_number(price), _number(quantity)] for price, quantity in event.bids[:10]],
+        },
+    )
+
+
+def _crypto_ticker_control_plane_payload(event: BinanceTicker) -> dict[str, Any]:
+    _, normalized = _format_crypto_ticker(event)
+    return _crypto_raw_control_plane_payload(event_name=_EVENT_TICKER, event=event, normalized=normalized)
+
+
+def _crypto_bar_control_plane_payload(event: BinanceBar) -> dict[str, Any]:
+    _, normalized = _format_crypto_bar(event)
+    return _crypto_raw_control_plane_payload(event_name=_EVENT_OHLCV, event=event, normalized=normalized)
+
+
+def _crypto_mark_price_control_plane_payload(event: BinanceMarkPrice) -> dict[str, Any]:
+    _, normalized = _format_crypto_mark_price(event)
+    return _crypto_raw_control_plane_payload(event_name=_EVENT_MARK_PRICE, event=event, normalized=normalized)
+
+
+def _crypto_funding_rate_from_mark_control_plane_payload(event: BinanceMarkPrice) -> dict[str, Any]:
+    _, normalized = _format_crypto_funding_rate_from_mark(event)
+    return _crypto_raw_control_plane_payload(event_name=_EVENT_FUNDING_RATE, event=event, normalized=normalized)
+
+
+def _crypto_funding_rate_control_plane_payload(event: BinanceFundingRate) -> dict[str, Any]:
+    _, normalized = _format_crypto_funding_rate(event)
+    return _crypto_raw_control_plane_payload(event_name=_EVENT_FUNDING_RATE, event=event, normalized=normalized)
+
+
+def _crypto_open_interest_control_plane_payload(event: BinanceOpenInterest) -> dict[str, Any]:
+    _, normalized = _format_crypto_open_interest(event)
+    return _crypto_raw_control_plane_payload(event_name=_EVENT_OPEN_INTEREST, event=event, normalized=normalized)
+
+
 class CollectorRuntime:
     """Collector-owned live runtime driven by the KSXT ``KISRealtimeSession``.
 
@@ -1113,18 +1198,23 @@ class CollectorRuntime:
             async for event in stream_factory(adapter, symbol=symbol, instrument_type=instrument_type):
                 if isinstance(event, BinanceTrade):
                     published_event_name, payload = _format_crypto_trade(event)
+                    control_plane_payload = _crypto_trade_control_plane_payload(event)
                     canonical_event_name = _EVENT_TRADE
                 elif isinstance(event, BinanceOrderBookSnapshot):
                     published_event_name, payload = _format_crypto_order_book(event)
+                    control_plane_payload = _crypto_order_book_control_plane_payload(event)
                     canonical_event_name = _EVENT_ORDER_BOOK
                 elif isinstance(event, BinanceTicker):
                     published_event_name, payload = _format_crypto_ticker(event)
+                    control_plane_payload = _crypto_ticker_control_plane_payload(event)
                     canonical_event_name = _EVENT_TICKER
                 elif isinstance(event, BinanceBar):
                     published_event_name, payload = _format_crypto_bar(event)
+                    control_plane_payload = _crypto_bar_control_plane_payload(event)
                     canonical_event_name = _EVENT_OHLCV
                 elif isinstance(event, BinanceOpenInterest):
                     published_event_name, payload = _format_crypto_open_interest(event)
+                    control_plane_payload = _crypto_open_interest_control_plane_payload(event)
                     canonical_event_name = _EVENT_OPEN_INTEREST
                 else:
                     logger.debug("dropping unknown crypto event type: %r", type(event))
@@ -1140,6 +1230,7 @@ class CollectorRuntime:
                     canonical_symbol=channel_key.canonical_symbol,
                     instrument_type=instrument_type.value,
                     raw_symbol=symbol,
+                    control_plane_payload=control_plane_payload,
                 )
         except asyncio.CancelledError:
             raise
@@ -1225,6 +1316,7 @@ class CollectorRuntime:
                     continue
                 if _EVENT_MARK_PRICE in active:
                     published_event_name, payload = _format_crypto_mark_price(event)
+                    control_plane_payload = _crypto_mark_price_control_plane_payload(event)
                     await self._publish_event(
                         symbol=symbol,
                         market_scope="",
@@ -1234,9 +1326,11 @@ class CollectorRuntime:
                         canonical_symbol=canonical_symbol,
                         instrument_type=instrument_type.value,
                         raw_symbol=symbol,
+                        control_plane_payload=control_plane_payload,
                     )
                 if _EVENT_FUNDING_RATE in active:
                     published_event_name, payload = _format_crypto_funding_rate_from_mark(event)
+                    control_plane_payload = _crypto_funding_rate_from_mark_control_plane_payload(event)
                     await self._publish_event(
                         symbol=symbol,
                         market_scope="",
@@ -1246,6 +1340,7 @@ class CollectorRuntime:
                         canonical_symbol=canonical_symbol,
                         instrument_type=instrument_type.value,
                         raw_symbol=symbol,
+                        control_plane_payload=control_plane_payload,
                     )
         except asyncio.CancelledError:
             raise

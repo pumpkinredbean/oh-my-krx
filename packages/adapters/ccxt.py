@@ -190,6 +190,7 @@ class BinanceTrade:
     side: str | None
     occurred_at: datetime
     trade_id: str | None = None
+    raw: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +201,7 @@ class BinanceOrderBookSnapshot:
     occurred_at: datetime
     asks: tuple[tuple[Decimal, Decimal], ...]
     bids: tuple[tuple[Decimal, Decimal], ...]
+    raw: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +220,7 @@ class BinanceTicker:
     low: Decimal | None
     base_volume: Decimal | None
     quote_volume: Decimal | None
+    raw: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +237,7 @@ class BinanceBar:
     low: Decimal
     close: Decimal
     volume: Decimal
+    raw: list[Any] | tuple[Any, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +252,7 @@ class BinanceMarkPrice:
     funding_rate: Decimal | None = None
     funding_timestamp_ms: int | None = None
     next_funding_timestamp_ms: int | None = None
+    raw: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +265,7 @@ class BinanceFundingRate:
     funding_rate: Decimal | None
     funding_timestamp_ms: int | None = None
     next_funding_timestamp_ms: int | None = None
+    raw: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +277,7 @@ class BinanceOpenInterest:
     occurred_at: datetime
     open_interest_amount: Decimal | None
     open_interest_value: Decimal | None = None
+    raw: dict[str, Any] | None = None
 
 
 class BinanceLiveAdapter:
@@ -501,6 +508,7 @@ def _parse_ccxt_trade(symbol: str, raw: dict[str, Any]) -> BinanceTrade:
         side=raw.get("side"),
         occurred_at=occurred_at,
         trade_id=str(raw.get("id")) if raw.get("id") is not None else None,
+        raw=raw,
     )
 
 
@@ -529,6 +537,7 @@ def _parse_ccxt_order_book(symbol: str, raw: dict[str, Any], limit: int) -> Bina
         occurred_at=occurred_at,
         asks=_levels(raw.get("asks")),
         bids=_levels(raw.get("bids")),
+        raw=raw,
     )
 
 
@@ -572,6 +581,7 @@ def _parse_ccxt_ticker(symbol: str, instrument_type: str, raw: dict[str, Any]) -
         low=_to_decimal(raw.get("low")),
         base_volume=_to_decimal(raw.get("baseVolume")),
         quote_volume=_to_decimal(raw.get("quoteVolume")),
+        raw=raw,
     )
 
 
@@ -595,6 +605,7 @@ def _parse_ccxt_ohlcv_bar(
         low=_to_decimal(raw[3]) or Decimal(0),
         close=_to_decimal(raw[4]) or Decimal(0),
         volume=_to_decimal(raw[5]) if len(raw) > 5 else Decimal(0),
+        raw=raw,
     )
 
 
@@ -681,6 +692,7 @@ def _parse_ccxt_mark_price(symbol: str, instrument_type: str, raw: dict[str, Any
         funding_rate=_to_decimal(funding_rate_raw),
         funding_timestamp_ms=funding_ts_ms,
         next_funding_timestamp_ms=next_funding_ms,
+        raw=raw if isinstance(raw, dict) else None,
     )
 
 
@@ -702,6 +714,7 @@ def _parse_ccxt_funding_rate(symbol: str, instrument_type: str, raw: dict[str, A
         funding_rate=_to_decimal(rate),
         funding_timestamp_ms=int(funding_ts) if isinstance(funding_ts, (int, float)) else None,
         next_funding_timestamp_ms=int(next_funding_ts) if isinstance(next_funding_ts, (int, float)) else None,
+        raw=raw,
     )
 
 
@@ -721,4 +734,5 @@ def _parse_ccxt_open_interest(symbol: str, instrument_type: str, raw: dict[str, 
         occurred_at=occurred_at,
         open_interest_amount=_to_decimal(amount),
         open_interest_value=_to_decimal(value),
+        raw=raw,
     )

@@ -407,11 +407,26 @@ class CollectorDashboardService:
             instrument_type=instrument_type,
             raw_symbol=raw_symbol,
         )
+        control_payload = control_plane_payload
+        if control_payload is None:
+            # Crypto dashboard payloads may contain presentation/display fields
+            # for legacy UI compatibility. Never let that fallback leak into
+            # admin Events/control-plane/charts; runtime is expected to supply
+            # an explicit raw CCXT payload for crypto events.
+            if external_provider == "ccxt":
+                control_payload = {
+                    "provider": "ccxt",
+                    "payload_unavailable": True,
+                    "reason": "missing_crypto_control_plane_payload",
+                }
+            else:
+                control_payload = payload
+
         await self._control_plane.record_runtime_event(
             symbol=symbol,
             market_scope=market_scope,
             event_name=event_name,
-            payload=control_plane_payload if control_plane_payload is not None else payload,
+            payload=control_payload,
             provider=external_provider,
             canonical_symbol=canonical_symbol,
             instrument_type=instrument_type,
