@@ -1221,6 +1221,8 @@ class CollectorRuntime:
                     continue
                 if canonical_event_name != channel_key.event_name:
                     continue
+                if control_plane_payload.get("instrument_type") is None:
+                    control_plane_payload = {**control_plane_payload, "instrument_type": instrument_type.value}
                 await self._publish_event(
                     symbol=symbol,
                     market_scope="",
