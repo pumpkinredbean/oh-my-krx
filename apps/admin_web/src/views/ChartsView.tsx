@@ -433,6 +433,31 @@ export function computeAllowedFields(
   return { fields: [], layer: 'empty' };
 }
 
+export function rawEventMirrorKeysForPanels(
+  symbol: string,
+  eventName: string,
+  panels: ChartPanelSpec[],
+  targets: TargetRef[],
+): string[] {
+  const keys = new Set<string>();
+  for (const panel of panels) {
+    for (const b of panel.series_bindings) {
+      for (const slot of b.input_bindings) {
+        if (!slot.target_id || !slot.event_name || slot.event_name !== eventName) continue;
+        const tgt = targets.find((t) => t.target_id === slot.target_id);
+        if (tgt?.instrument.symbol === symbol) keys.add(`${slot.target_id}:${eventName}`);
+      }
+    }
+    if (panel.base_feed?.target_id) {
+      const baseEvent = panel.base_feed.event_name || 'ohlcv';
+      if (baseEvent !== eventName) continue;
+      const tgt = targets.find((t) => t.target_id === panel.base_feed!.target_id);
+      if (tgt?.instrument.symbol === symbol) keys.add(`${panel.base_feed.target_id}:${baseEvent}`);
+    }
+  }
+  return Array.from(keys);
+}
+
 // ─── ChartPanel ───────────────────────────────────────────────────────────
 
 function ChartPanel({
@@ -1160,7 +1185,12 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
   const [indicatorOutputs, setIndicatorOutputs] = useState<Map<string, SeriesPoint[]>>(new Map());
   const [rawEvents, setRawEvents] = useState<Map<string, Array<Record<string, unknown>>>>(new Map());
 
+  const panelsRef = useRef<ChartPanelSpec[]>(panels);
+  const targetsRef = useRef<TargetRef[]>(targets);
   const seedAttemptedRef = useRef(false);
+
+  useEffect(() => { panelsRef.current = panels; }, [panels]);
+  useEffect(() => { targetsRef.current = targets; }, [targets]);
 
   const refresh = useCallback(async () => {
     try {
@@ -1260,12 +1290,18 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
         } as Record<string, unknown>;
         setRawEvents((prev) => {
           const next = new Map(prev);
-          // Index by every known target_id whose panel binding refers to this symbol+event.
-          // For simplicity we index by both `<symbol>:<event>` and `<targetId>:<event>`
-          // — the target-id index is set when bindings know their target_id.
           const symKey = `${symbol}:${eventName}`;
           const cur = next.get(symKey) ?? [];
-          next.set(symKey, [...cur, row].slice(-500));
+          const updatedRows = [...cur, row].slice(-500);
+          next.set(symKey, updatedRows);
+          for (const tgtKey of rawEventMirrorKeysForPanels(
+            symbol,
+            eventName,
+            panelsRef.current,
+            targetsRef.current,
+          )) {
+            next.set(tgtKey, updatedRows);
+          }
           return next;
         });
       } catch { /* ignore */ }
@@ -1273,11 +1309,12 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
     return () => es.close();
   }, []);
 
-  // For panels that use target_id keying in bindings, mirror raw events under
-  // `<target_id>:<event_name>` so ChartPanel lookup works.
+  // Backfill target-keyed mirrors when panels/targets change after symbol-keyed
+  // raw rows already exist. Live SSE updates refresh these mirrors inline above.
   useEffect(() => {
     setRawEvents((prev) => {
       const next = new Map(prev);
+      let changed = false;
       for (const panel of panels) {
         for (const b of panel.series_bindings) {
           for (const slot of b.input_bindings) {
@@ -1286,8 +1323,10 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
             if (!tgt) continue;
             const symKey = `${tgt.instrument.symbol}:${slot.event_name}`;
             const tgtKey = `${slot.target_id}:${slot.event_name}`;
-            if (next.has(symKey) && !next.has(tgtKey)) {
-              next.set(tgtKey, next.get(symKey) ?? []);
+            const rows = next.get(symKey);
+            if (rows && next.get(tgtKey) !== rows) {
+              next.set(tgtKey, rows);
+              changed = true;
             }
           }
         }
@@ -1296,15 +1335,17 @@ export default function ChartsView({ capabilities, targets, onRefresh }: ChartsV
           if (tgt) {
             const symKey = `${tgt.instrument.symbol}:${panel.base_feed.event_name || 'ohlcv'}`;
             const tgtKey = `${panel.base_feed.target_id}:${panel.base_feed.event_name || 'ohlcv'}`;
-            if (next.has(symKey) && !next.has(tgtKey)) {
-              next.set(tgtKey, next.get(symKey) ?? []);
+            const rows = next.get(symKey);
+            if (rows && next.get(tgtKey) !== rows) {
+              next.set(tgtKey, rows);
+              changed = true;
             }
           }
         }
       }
-      return next;
+      return changed ? next : prev;
     });
-  }, [panels, targets, rawEvents.size]);
+  }, [panels, targets, rawEvents]);
 
   // Sync layout with panels.
   useEffect(() => {

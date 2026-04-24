@@ -32,3 +32,14 @@ def test_charts_grid_is_not_shrunk_by_inspector_column() -> None:
     assert "grid-template-columns: minmax(0, 1fr);" in css
     assert "grid-template-columns: 1fr 340px" not in css
     assert "width={1200}" not in source
+
+
+def test_raw_event_target_mirror_updates_existing_keys() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    assert "const updatedRows = [...cur, row].slice(-500);" in source
+    assert "next.set(symKey, updatedRows);" in source
+    assert "rawEventMirrorKeysForPanels(" in source
+    assert "next.set(tgtKey, updatedRows);" in source
+    assert "rawEvents.size" not in source
+    assert "next.get(tgtKey) !== rows" in source
