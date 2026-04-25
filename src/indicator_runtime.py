@@ -32,7 +32,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -597,6 +597,7 @@ class ChartsStateStore:
 
     # -- mutators -----------------------------------------------------------
     async def upsert_panel(self, panel: ChartPanelSpec) -> ChartPanelSpec:
+        panel = sanitize_chart_panel_spec(panel)
         async with self._lock:
             self._panels[panel.panel_id] = panel
             # Register panel-scoped scripts + instances into the global
@@ -1000,12 +1001,68 @@ _CHART_PANEL_FIELDS: frozenset[str] = frozenset(
 )
 
 
+def scrub_legacy_normalized_binding_value(value: Any) -> Any:
+    """Reset stale persisted chart binding values that point at normalized.*."""
+    if isinstance(value, str) and value.startswith("normalized."):
+        return ""
+    return value
+
+
+def _scrub_chart_binding_text(value: Any) -> str:
+    return str(scrub_legacy_normalized_binding_value(value) or "")
+
+
+def _sanitize_chart_param_values(params: tuple[tuple[str, Any], ...]) -> tuple[tuple[str, Any], ...]:
+    sanitized: list[tuple[str, Any]] = []
+    for key, value in params:
+        if key in {"field", "time_field"}:
+            value = scrub_legacy_normalized_binding_value(value)
+        sanitized.append((key, value))
+    return tuple(sanitized)
+
+
+def sanitize_chart_panel_spec(panel: ChartPanelSpec) -> ChartPanelSpec:
+    """Return a panel with legacy normalized.* field/time bindings cleared."""
+    bindings: list[ChartSeriesBinding] = []
+    for binding in panel.series_bindings:
+        inputs = tuple(
+            replace(
+                slot,
+                time_field_name=_scrub_chart_binding_text(slot.time_field_name),
+                field_name=_scrub_chart_binding_text(slot.field_name),
+            )
+            for slot in binding.input_bindings
+        )
+        bindings.append(
+            replace(
+                binding,
+                input_bindings=inputs,
+                param_values=_sanitize_chart_param_values(binding.param_values),
+            )
+        )
+    base_feed = panel.base_feed
+    if base_feed is not None:
+        base_feed = replace(
+            base_feed,
+            time_field_name=_scrub_chart_binding_text(base_feed.time_field_name),
+        )
+    return replace(panel, series_bindings=tuple(bindings), base_feed=base_feed)
+
+
 def _input_slot_from_entry(entry: Any) -> ChartInputSlot:
     if isinstance(entry, ChartInputSlot):
-        return entry
+        return replace(
+            entry,
+            time_field_name=_scrub_chart_binding_text(entry.time_field_name),
+            field_name=_scrub_chart_binding_text(entry.field_name),
+        )
     if not isinstance(entry, dict):
         return ChartInputSlot(slot_name="")
     filtered = {k: str(v or "") for k, v in entry.items() if k in _CHART_INPUT_SLOT_FIELDS}
+    if "time_field_name" in filtered:
+        filtered["time_field_name"] = _scrub_chart_binding_text(filtered["time_field_name"])
+    if "field_name" in filtered:
+        filtered["field_name"] = _scrub_chart_binding_text(filtered["field_name"])
     return ChartInputSlot(**filtered)
 
 
@@ -1033,8 +1090,8 @@ def _migrate_legacy_binding(entry: dict[str, Any]) -> dict[str, Any]:
     if source_kind == "raw":
         target_id = str(entry.get("target_id") or entry.get("symbol") or "")
         event_name = str(entry.get("event_name") or "trade")
-        field_name = str(entry.get("field_name") or "")
-        time_field_name = str(entry.get("time_field_name") or "")
+        field_name = _scrub_chart_binding_text(entry.get("field_name"))
+        time_field_name = _scrub_chart_binding_text(entry.get("time_field_name"))
         new_entry["indicator_ref"] = "builtin.raw"
         new_entry["input_bindings"] = (
             {
@@ -1092,6 +1149,7 @@ def _series_binding_from_entry(entry: Any) -> ChartSeriesBinding:
         filtered["param_values"] = tuple(coerced)
     else:
         filtered["param_values"] = ()
+    filtered["param_values"] = _sanitize_chart_param_values(filtered["param_values"])
     filtered.setdefault("binding_id", f"bind-{uuid.uuid4().hex[:10]}")
     return ChartSeriesBinding(**filtered)
 
@@ -1100,13 +1158,13 @@ def _base_feed_from_entry(entry: Any) -> ChartPanelBaseFeed | None:
     if entry is None:
         return None
     if isinstance(entry, ChartPanelBaseFeed):
-        return entry
+        return replace(entry, time_field_name=_scrub_chart_binding_text(entry.time_field_name))
     if not isinstance(entry, dict):
         return None
     return ChartPanelBaseFeed(
         target_id=str(entry.get("target_id") or ""),
         event_name=str(entry.get("event_name") or "ohlcv"),
-        time_field_name=str(entry.get("time_field_name") or ""),
+        time_field_name=_scrub_chart_binding_text(entry.get("time_field_name")),
     )
 
 

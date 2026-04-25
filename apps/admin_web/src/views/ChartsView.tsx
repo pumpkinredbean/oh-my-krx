@@ -225,6 +225,23 @@ function paramValuesFromAny(raw: unknown): Record<string, unknown> {
   return {};
 }
 
+function scrubLegacyNormalizedBindingValue(value: unknown): unknown {
+  if (typeof value === 'string' && value.startsWith('normalized.')) return '';
+  return value;
+}
+
+function bindingText(value: unknown): string {
+  return String(scrubLegacyNormalizedBindingValue(value) ?? '');
+}
+
+function sanitizeParamValues(values: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...values,
+    field: scrubLegacyNormalizedBindingValue(values.field),
+    time_field: scrubLegacyNormalizedBindingValue(values.time_field),
+  };
+}
+
 function normalizePanel(raw: any): ChartPanelSpec {
   return {
     panel_id: raw.panel_id,
@@ -240,7 +257,7 @@ function normalizePanel(raw: any): ChartPanelSpec {
       ? {
           target_id: raw.base_feed.target_id ?? '',
           event_name: raw.base_feed.event_name ?? 'ohlcv',
-          time_field_name: raw.base_feed.time_field_name ?? '',
+          time_field_name: bindingText(raw.base_feed.time_field_name),
         }
       : null,
     scripts: Array.isArray(raw.scripts) ? raw.scripts : [],
@@ -255,11 +272,11 @@ function normalizePanel(raw: any): ChartPanelSpec {
                 slot_name: s.slot_name ?? '',
                 target_id: s.target_id ?? '',
                 event_name: s.event_name ?? '',
-                time_field_name: s.time_field_name ?? '',
-                field_name: s.field_name ?? '',
+                time_field_name: bindingText(s.time_field_name),
+                field_name: bindingText(s.field_name),
               }))
             : [],
-          param_values: paramValuesFromAny(b.param_values),
+          param_values: sanitizeParamValues(paramValuesFromAny(b.param_values)),
           output_name: b.output_name ?? '',
           axis: b.axis ?? 'left',
           color: b.color ?? '',

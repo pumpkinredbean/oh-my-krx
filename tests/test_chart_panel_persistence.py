@@ -190,6 +190,112 @@ class ChartsStateRoundTripTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(b.input_bindings[0].field_name, "price")
             self.assertEqual(dict(b.param_values), {"field": "price", "time_field": "raw.info.T"})
 
+    async def test_legacy_normalized_bindings_are_scrubbed_on_load(self) -> None:
+        from src.indicator_runtime import ChartsStateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "admin_charts.json"
+            snapshot = {
+                "panels": [
+                    {
+                        "panel_id": "legacy-normalized",
+                        "chart_type": "candle",
+                        "symbol": "BTCUSDT",
+                        "base_feed": {
+                            "target_id": "tgt-1",
+                            "event_name": "ohlcv",
+                            "time_field_name": "normalized.timestamp",
+                        },
+                        "series_bindings": [
+                            {
+                                "binding_id": "b-normalized",
+                                "indicator_ref": "builtin.raw",
+                                "input_bindings": [
+                                    {
+                                        "slot_name": "source",
+                                        "target_id": "tgt-1",
+                                        "event_name": "trade",
+                                        "time_field_name": "normalized.timestamp",
+                                        "field_name": "normalized.price",
+                                    }
+                                ],
+                                "param_values": [
+                                    ["field", "normalized.price"],
+                                    ["time_field", "normalized.timestamp"],
+                                ],
+                                "output_name": "value",
+                            }
+                        ],
+                    }
+                ],
+                "scripts": [],
+                "instances": [],
+                "schema_version": "v1",
+            }
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            store = ChartsStateStore(path=path)
+            store.load()
+            panel = (await store.list_panels())[0]
+            self.assertEqual(panel.base_feed.time_field_name, "")  # type: ignore[union-attr]
+            slot = panel.series_bindings[0].input_bindings[0]
+            self.assertEqual(slot.field_name, "")
+            self.assertEqual(slot.time_field_name, "")
+            self.assertEqual(dict(panel.series_bindings[0].param_values), {"field": "", "time_field": ""})
+
+    async def test_panel_put_scrubs_normalized_field_time_params_and_base_feed(self) -> None:
+        from apps.collector import service
+        from src.indicator_runtime import ChartsStateStore
+
+        class Request:
+            async def json(self) -> dict:
+                return {
+                    "panel_id": "p-normalized-put",
+                    "chart_type": "candle",
+                    "symbol": "BTCUSDT",
+                    "base_feed": {
+                        "target_id": "t-btc",
+                        "event_name": "ohlcv",
+                        "time_field_name": "normalized.timestamp",
+                    },
+                    "series_bindings": [
+                        {
+                            "binding_id": "b1",
+                            "indicator_ref": "builtin.raw",
+                            "input_bindings": [
+                                {
+                                    "slot_name": "source",
+                                    "target_id": "t-btc",
+                                    "event_name": "trade",
+                                    "time_field_name": "normalized.timestamp",
+                                    "field_name": "normalized.price",
+                                }
+                            ],
+                            "param_values": [["field", "normalized.price"], ["time_field", "normalized.timestamp"]],
+                            "output_name": "value",
+                        }
+                    ],
+                }
+
+        class RuntimeManager:
+            async def reconcile(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ChartsStateStore(path=Path(tmp) / "admin_charts.json")
+            with patch.object(service, "charts_state_store", store), patch.object(
+                service, "indicator_runtime_manager", RuntimeManager()
+            ):
+                put_resp = await service.admin_charts_upsert_panel(Request())  # type: ignore[arg-type]
+                put_panel = json.loads(put_resp.body)["panel"]
+                self.assertEqual(put_panel["base_feed"]["time_field_name"], "")
+                slot = put_panel["series_bindings"][0]["input_bindings"][0]
+                self.assertEqual(slot["field_name"], "")
+                self.assertEqual(slot["time_field_name"], "")
+                self.assertEqual(dict(put_panel["series_bindings"][0]["param_values"]), {"field": "", "time_field": ""})
+
+                list_panel = json.loads((await service.admin_charts_list_panels()).body)["panels"][0]
+                self.assertNotIn("normalized.", json.dumps(list_panel))
+
     async def test_legacy_source_kind_builtin_is_migrated(self) -> None:
         from src.indicator_runtime import ChartsStateStore
 

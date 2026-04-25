@@ -95,6 +95,7 @@ from src.indicator_runtime import (
     new_instance_id,
     new_panel_id,
     new_script_id,
+    scrub_legacy_normalized_binding_value,
     validate_and_instantiate,
 )
 
@@ -814,8 +815,8 @@ async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
                     slot_name=str(slot.get("slot_name") or "") if isinstance(slot, dict) else "",
                     target_id=str(slot.get("target_id") or "") if isinstance(slot, dict) else "",
                     event_name=str(slot.get("event_name") or "") if isinstance(slot, dict) else "",
-                    time_field_name=str(slot.get("time_field_name") or "") if isinstance(slot, dict) else "",
-                    field_name=str(slot.get("field_name") or "") if isinstance(slot, dict) else "",
+                    time_field_name=_chart_binding_text(slot.get("time_field_name")) if isinstance(slot, dict) else "",
+                    field_name=_chart_binding_text(slot.get("field_name")) if isinstance(slot, dict) else "",
                 )
                 for slot in input_bindings_raw
             )
@@ -843,7 +844,7 @@ async def admin_charts_upsert_panel(request: Request) -> JSONResponse:
             base_feed = ChartPanelBaseFeed(
                 target_id=str(base_feed_raw.get("target_id") or ""),
                 event_name=str(base_feed_raw.get("event_name") or "ohlcv"),
-                time_field_name=str(base_feed_raw.get("time_field_name") or ""),
+                time_field_name=_chart_binding_text(base_feed_raw.get("time_field_name")),
             )
 
         # Panel-scoped scripts + instances (optional).
@@ -925,16 +926,28 @@ def body_param_values(raw: Any):
     if raw is None:
         return ()
     if isinstance(raw, dict):
+        raw = {
+            str(k): scrub_legacy_normalized_binding_value(v) if str(k) in {"field", "time_field"} else v
+            for k, v in raw.items()
+        }
         return param_values_from_dict(raw)
     if isinstance(raw, (list, tuple)):
         out: list[tuple[str, Any]] = []
         for pv in raw:
             if isinstance(pv, (list, tuple)) and len(pv) >= 2:
-                out.append((str(pv[0]), pv[1]))
+                name = str(pv[0])
+                value = scrub_legacy_normalized_binding_value(pv[1]) if name in {"field", "time_field"} else pv[1]
+                out.append((name, value))
             elif isinstance(pv, dict) and "name" in pv:
-                out.append((str(pv["name"]), pv.get("value")))
+                name = str(pv["name"])
+                value = scrub_legacy_normalized_binding_value(pv.get("value")) if name in {"field", "time_field"} else pv.get("value")
+                out.append((name, value))
         return tuple(out)
     return ()
+
+
+def _chart_binding_text(value: Any) -> str:
+    return str(scrub_legacy_normalized_binding_value(value) or "")
 
 
 @app.delete("/admin/charts/panels/{panel_id}")

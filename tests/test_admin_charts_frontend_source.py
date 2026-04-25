@@ -47,6 +47,17 @@ def test_normalized_candidates_are_filtered_from_value_fields() -> None:
     assert "if (top === 'normalized') continue;" in source
 
 
+def test_normalize_panel_scrubs_legacy_normalized_bindings() -> None:
+    source = CHARTS_VIEW.read_text()
+
+    assert "function scrubLegacyNormalizedBindingValue" in source
+    assert "value.startsWith('normalized.')" in source
+    assert "time_field_name: bindingText(raw.base_feed.time_field_name)" in source
+    assert "time_field_name: bindingText(s.time_field_name)" in source
+    assert "field_name: bindingText(s.field_name)" in source
+    assert "param_values: sanitizeParamValues(paramValuesFromAny(b.param_values))" in source
+
+
 def test_layout_storage_is_v4_and_clamped_full_width() -> None:
     source = CHARTS_VIEW.read_text()
 
