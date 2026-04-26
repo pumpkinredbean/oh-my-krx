@@ -1,0 +1,28 @@
+{
+  "target": "http://127.0.0.1:8000/admin/events",
+  "target_id": "events-e2e-binance-spot-btcusdt",
+  "configured_event_types": [
+    "trade",
+    "order_book_snapshot",
+    "ticker",
+    "ohlcv"
+  ],
+  "requested_streams": [
+    "http://127.0.0.1:8000/api/admin/events/stream?limit=50",
+    "http://127.0.0.1:8000/api/admin/events/stream?limit=1",
+    "http://127.0.0.1:8000/api/admin/events/stream?target_id=events-e2e-binance-spot-btcusdt&symbol=BTC%2FUSDT&event_name=order_book_snapshot&limit=50",
+    "http://127.0.0.1:8000/api/admin/events/stream?limit=50",
+    "http://127.0.0.1:8000/api/admin/events/stream?limit=1"
+  ],
+  "screenshot": "docs/verification/admin-events-e2e-2026-04-26/admin-events-e2e.png",
+  "checks": {
+    "targetSelectorVisible": true,
+    "targetOptionsContainTarget": true,
+    "eventOptionsEqualConfigured": true,
+    "orderBookOptionExists": true,
+    "filteredRowsOrderBookOnly": true,
+    "payloadRawOrderBookOnly": true,
+    "reloadRecoversConfiguredOptions": true,
+    "normalizedNotExposed": true
+  }
+}

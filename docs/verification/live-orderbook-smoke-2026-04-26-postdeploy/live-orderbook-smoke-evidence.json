@@ -1,0 +1,95 @@
+{
+  "ok": true,
+  "target_id": "3c61260a894b4dbea458321434ca5275",
+  "configured_event_types": [
+    "trade",
+    "order_book_snapshot",
+    "ticker",
+    "ohlcv"
+  ],
+  "url": "http://127.0.0.1:8000/api/admin/events?target_id=3c61260a894b4dbea458321434ca5275&event_name=order_book_snapshot&limit=50",
+  "duration_seconds": 30.0,
+  "samples": [
+    {
+      "observed_at": "2026-04-26T03:28:28.014892+00:00",
+      "event_count": 18,
+      "last_seen": "2026-04-26T03:28:27.797504",
+      "row_count": 18,
+      "first_event_id": "0511dee8c1ea46efa60755edb0c02f5f"
+    },
+    {
+      "observed_at": "2026-04-26T03:28:33.034358+00:00",
+      "event_count": 48,
+      "last_seen": "2026-04-26T03:28:32.978248",
+      "row_count": 48,
+      "first_event_id": "56227d70e7ce4c5981d518ec1bda60de"
+    },
+    {
+      "observed_at": "2026-04-26T03:28:38.069905+00:00",
+      "event_count": 50,
+      "last_seen": "2026-04-26T03:28:38.051416",
+      "row_count": 50,
+      "first_event_id": "d9cbcd4429b14fd78f6f03afd3f296bb"
+    },
+    {
+      "observed_at": "2026-04-26T03:28:43.105048+00:00",
+      "event_count": 50,
+      "last_seen": "2026-04-26T03:28:43.080297",
+      "row_count": 50,
+      "first_event_id": "512768aeef2343bead3b6c8fbb58fd48"
+    },
+    {
+      "observed_at": "2026-04-26T03:28:48.129883+00:00",
+      "event_count": 50,
+      "last_seen": "2026-04-26T03:28:48.080737",
+      "row_count": 50,
+      "first_event_id": "853b8b6fefe7403bba5dbf236e0bb1f0"
+    },
+    {
+      "observed_at": "2026-04-26T03:28:53.158660+00:00",
+      "event_count": 50,
+      "last_seen": "2026-04-26T03:28:52.985520",
+      "row_count": 50,
+      "first_event_id": "9585d2640c8e42f994981585138a180b"
+    },
+    {
+      "observed_at": "2026-04-26T03:28:58.186987+00:00",
+      "event_count": 50,
+      "last_seen": "2026-04-26T03:28:58.081675",
+      "row_count": 50,
+      "first_event_id": "bf4944db4bde406dba6ed4213ccc4063"
+    }
+  ],
+  "checks": {
+    "enabledTargetFound": true,
+    "rowCountGreaterThanZero": true,
+    "countIncreasesOrLastSeenUpdates": true,
+    "rawBidsAsksPresent": true,
+    "normalizedAbsent": true,
+    "allRowsAreOrderBook": true
+  },
+  "final_event_counts": {
+    "order_book_snapshot": 50
+  },
+  "final_event_last_seen": {
+    "order_book_snapshot": "2026-04-26T03:28:58.081675"
+  },
+  "first_event_payload_keys": [
+    "event_name",
+    "instrument_type",
+    "occurred_at",
+    "provider",
+    "raw",
+    "received_at",
+    "symbol",
+    "venue"
+  ],
+  "first_raw_keys": [
+    "asks",
+    "bids",
+    "datetime",
+    "nonce",
+    "symbol",
+    "timestamp"
+  ]
+}
