@@ -122,6 +122,18 @@ interface RecentRuntimeEvent {
   raw_symbol?: string | null;
 }
 
+interface RuntimeEventBatch {
+  new_events: RecentRuntimeEvent[];
+  /** Deprecated: observed names from recent buffer; never used for filter options. */
+  available_event_names?: string[];
+  configured_event_names?: string[];
+  observed_event_names?: string[];
+  event_counts?: Record<string, number>;
+  event_last_seen?: Record<string, string>;
+  buffer_size: number;
+  captured_at: string;
+}
+
 // ─── Utils ────────────────────────────────────────────────────────────────────
 
 const MARKET_SCOPES: MarketScope[] = ['krx', 'nxt', 'total'];
@@ -1094,11 +1106,16 @@ function RuntimeView({ snapshot, onRefresh }: { snapshot: Snapshot | null; onRef
 
 function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
   const targets = snapshot?.collection_targets ?? [];
+  const enabledTargets = targets.filter((t) => t.enabled);
 
   const [events, setEvents] = useState<RecentRuntimeEvent[]>([]);
   const [bufferSize, setBufferSize] = useState<number>(0);
   const [capturedAt, setCapturedAt] = useState<string>('');
-  const [availableNames, setAvailableNames] = useState<string[]>([]);
+  const [configuredNames, setConfiguredNames] = useState<string[]>([]);
+  const [observedNames, setObservedNames] = useState<string[]>([]);
+  const [eventCounts, setEventCounts] = useState<Record<string, number>>({});
+  const [eventLastSeen, setEventLastSeen] = useState<Record<string, string>>({});
+  const [filterTargetId, setFilterTargetId] = useState('');
   const [filterSymbol, setFilterSymbol] = useState('');
   const [filterScope, setFilterScope] = useState('');
   const [filterName, setFilterName] = useState('');
@@ -1108,6 +1125,7 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   // Pending filter values — applied on "적용" click to avoid reconnecting on each keystroke
+  const [pendingTargetId, setPendingTargetId] = useState('');
   const [pendingSymbol, setPendingSymbol] = useState('');
   const [pendingScope, setPendingScope] = useState('');
   const [pendingName, setPendingName] = useState('');
@@ -1115,9 +1133,21 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
 
   const esRef = useRef<EventSource | null>(null);
 
+  const selectedTarget = targets.find((t) => t.target_id === pendingTargetId) ?? null;
+  const configuredOptionNames = selectedTarget
+    ? selectedTarget.event_types
+    : [...new Set(enabledTargets.flatMap((t) => t.event_types))];
+
+  function targetLabel(t: CollectionTarget): string {
+    const provider = (t.provider ?? t.instrument.provider ?? 'kxt').toUpperCase();
+    const itype = t.instrument.instrument_type ?? '—';
+    return `${t.instrument.symbol} · ${provider} · ${itype} · ${t.event_types.join(', ')}`;
+  }
+
   const buildStreamUrl = useCallback(
-    (sym: string, scope: string, name: string, lim: number) => {
+    (targetId: string, sym: string, scope: string, name: string, lim: number) => {
       const params = new URLSearchParams();
+      if (targetId) params.set('target_id', targetId);
       if (sym.trim()) params.set('symbol', sym.trim());
       if (scope) params.set('scope', scope);
       if (name) params.set('event_name', name);
@@ -1128,7 +1158,7 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
   );
 
   const openStream = useCallback(
-    (sym: string, scope: string, name: string, lim: number) => {
+    (targetId: string, sym: string, scope: string, name: string, lim: number) => {
       // Close any existing stream first
       if (esRef.current) {
         esRef.current.close();
@@ -1138,7 +1168,7 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
       setStreamStatus('connecting');
       setStreamError('');
 
-      const url = buildStreamUrl(sym, scope, name, lim);
+      const url = buildStreamUrl(targetId, sym, scope, name, lim);
       const es = new EventSource(url);
       esRef.current = es;
 
@@ -1150,12 +1180,7 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
 
       es.addEventListener('events', (e: MessageEvent) => {
         try {
-          const batch = JSON.parse(e.data) as {
-            new_events: RecentRuntimeEvent[];
-            available_event_names: string[];
-            buffer_size: number;
-            captured_at: string;
-          };
+          const batch = JSON.parse(e.data) as RuntimeEventBatch;
           setStreamStatus('live');
           if (batch.new_events && batch.new_events.length > 0) {
             setEvents((prev) => {
@@ -1164,7 +1189,10 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
               return combined.slice(0, lim);
             });
           }
-          if (batch.available_event_names) setAvailableNames(batch.available_event_names);
+          if (batch.configured_event_names) setConfiguredNames(batch.configured_event_names);
+          if (batch.observed_event_names) setObservedNames(batch.observed_event_names);
+          if (batch.event_counts) setEventCounts(batch.event_counts);
+          if (batch.event_last_seen) setEventLastSeen(batch.event_last_seen);
           if (batch.buffer_size !== undefined) setBufferSize(batch.buffer_size);
           if (batch.captured_at) setCapturedAt(batch.captured_at);
         } catch {
@@ -1211,7 +1239,7 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
 
   // Open stream on mount with default filters
   useEffect(() => {
-    openStream(filterSymbol, filterScope, filterName, limit);
+    openStream(filterTargetId, filterSymbol, filterScope, filterName, limit);
     return () => {
       if (esRef.current) {
         esRef.current.close();
@@ -1222,12 +1250,17 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
 
   // Apply pending filters and reconnect stream
   function applyFilters() {
+    setFilterTargetId(pendingTargetId);
     setFilterSymbol(pendingSymbol);
     setFilterScope(pendingScope);
     setFilterName(pendingName);
     setLimit(pendingLimit);
     setEvents([]);
-    openStream(pendingSymbol, pendingScope, pendingName, pendingLimit);
+    setConfiguredNames([]);
+    setObservedNames([]);
+    setEventCounts({});
+    setEventLastSeen({});
+    openStream(pendingTargetId, pendingSymbol, pendingScope, pendingName, pendingLimit);
   }
 
   // Build symbol options from known targets
@@ -1256,6 +1289,26 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
 
         {/* Filters — changes are pending until "적용" is clicked */}
         <div className="filter-bar">
+          <select
+            value={pendingTargetId}
+            onChange={(e) => {
+              const nextTargetId = e.target.value;
+              const nextTarget = targets.find((t) => t.target_id === nextTargetId) ?? null;
+              setPendingTargetId(nextTargetId);
+              if (nextTarget) {
+                setPendingSymbol(nextTarget.instrument.symbol);
+                setPendingScope(nextTarget.market_scope || '');
+                if (pendingName && !nextTarget.event_types.includes(pendingName)) setPendingName('');
+              }
+            }}
+          >
+            <option value="">모든 타깃</option>
+            {targets.map((t) => (
+              <option key={t.target_id} value={t.target_id}>
+                {targetLabel(t)}
+              </option>
+            ))}
+          </select>
           <select value={pendingSymbol} onChange={(e) => setPendingSymbol(e.target.value)}>
             <option value="">모든 종목</option>
             {symbolOptions.map((s) => (
@@ -1274,7 +1327,7 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
           </select>
           <select value={pendingName} onChange={(e) => setPendingName(e.target.value)}>
             <option value="">모든 이벤트</option>
-            {availableNames.map((n) => (
+            {configuredOptionNames.map((n) => (
               <option key={n} value={n}>
                 {n}
               </option>
@@ -1302,6 +1355,38 @@ function EventsView({ snapshot }: { snapshot: Snapshot | null }) {
         {streamStatus !== 'error' && streamError && (
           <div className="hint error-hint">수집기 오류: {streamError}</div>
         )}
+
+        <div className="field-block">
+          <div className="field-block-head">
+            <span>Configured Events</span>
+            <span className="count-pill">{(configuredNames.length ? configuredNames : configuredOptionNames).length}</span>
+          </div>
+          <div className="event-pills">
+            {(configuredNames.length ? configuredNames : configuredOptionNames).map((name) => (
+              <span key={name} className="badge default" title={`last_seen: ${fmt(eventLastSeen[name])}`}>
+                {name} · {eventCounts[name] ?? 0} · {eventLastSeen[name] ? fmt(eventLastSeen[name]) : 'no recent sample'}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div className="field-block">
+          <div className="field-block-head">
+            <span>Observed Recent Events</span>
+            <span className="count-pill">{observedNames.length}</span>
+          </div>
+          {observedNames.length === 0 ? (
+            <div className="hint">최근 버퍼에 관측된 이벤트 없음</div>
+          ) : (
+            <div className="event-pills">
+              {observedNames.map((name) => (
+                <span key={name} className="badge default">
+                  {name} · {eventCounts[name] ?? 0} · {fmt(eventLastSeen[name])}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
 
         {events.length === 0 ? (
           <Empty msg="최근 이벤트 없음 — 수집 대상을 활성화하면 이벤트가 쌓입니다." />

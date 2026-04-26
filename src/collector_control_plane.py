@@ -787,6 +787,21 @@ class CollectorControlPlaneService:
             events = tuple(self._recent_events)
             targets = tuple(self._targets.values())
 
+        metadata_targets = tuple(
+            target
+            for target in targets
+            if (target.target_id == requested_target_id if requested_target_id else target.enabled)
+            and (not requested_symbol or target.instrument.symbol == requested_symbol)
+            and (not requested_market_scope or target.market_scope == requested_market_scope)
+        )
+        configured_event_names = tuple(
+            dict.fromkeys(
+                event_type
+                for target in metadata_targets
+                for event_type in target.event_types
+            )
+        )
+
         filtered_events: list[RecentRuntimeEvent] = []
         for event in events:
             if requested_target_id and requested_target_id not in event.matched_target_ids:
@@ -800,6 +815,15 @@ class CollectorControlPlaneService:
             filtered_events.append(event)
             if len(filtered_events) >= resolved_limit:
                 break
+
+        observed_event_names = tuple(sorted({event.event_name for event in filtered_events}))
+        event_counts: dict[str, int] = {}
+        event_last_seen: dict[str, datetime] = {}
+        for event in filtered_events:
+            event_counts[event.event_name] = event_counts.get(event.event_name, 0) + 1
+            if event.event_name not in event_last_seen:
+                # _recent_events is newest-first, so first occurrence is last seen.
+                event_last_seen[event.event_name] = event.published_at
 
         filtered_target_ids = {target_id for event in filtered_events for target_id in event.matched_target_ids}
         target_options = tuple(
@@ -822,7 +846,13 @@ class CollectorControlPlaneService:
                 "event_name": requested_event_name or None,
                 "limit": resolved_limit,
             },
+            # Deprecated compatibility field: observed names from the recent buffer,
+            # not a configured event-option source.
             "available_event_names": tuple(sorted({event.event_name for event in events})),
+            "configured_event_names": configured_event_names,
+            "observed_event_names": observed_event_names,
+            "event_counts": event_counts,
+            "event_last_seen": event_last_seen,
             "recent_events": tuple(filtered_events),
             "target_options": target_options,
             "buffer_size": len(events),

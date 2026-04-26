@@ -511,6 +511,24 @@ def _all_dashboard_event_types() -> tuple[str, ...]:
     return tuple(event_type.value for event_type in EventType)
 
 
+def _admin_events_batch_from_recent(recent_payload: dict[str, Any]) -> dict[str, Any]:
+    """Build the admin Events SSE batch shape from a recent-events payload.
+
+    The legacy ``available_event_names`` field remains observed-buffer-only;
+    clients must use ``configured_event_names`` for filter options.
+    """
+    return {
+        "new_events": recent_payload.get("recent_events") or [],
+        "available_event_names": sorted(set(recent_payload.get("available_event_names") or [])),
+        "configured_event_names": recent_payload.get("configured_event_names") or [],
+        "observed_event_names": recent_payload.get("observed_event_names") or [],
+        "event_counts": recent_payload.get("event_counts") or {},
+        "event_last_seen": recent_payload.get("event_last_seen") or {},
+        "buffer_size": recent_payload.get("buffer_size") or 0,
+        "captured_at": str(recent_payload.get("captured_at") or ""),
+    }
+
+
 app = FastAPI(title="Collector Service")
 service_settings = load_service_settings("collector")
 dashboard_service = CollectorDashboardService(service_settings)
@@ -664,16 +682,9 @@ async def admin_events_stream(
                 event_name=normalized_event_name,
                 limit=limit,
             )
-            initial_events = initial.get("recent_events") or []
             known_event_names: set[str] = set(initial.get("available_event_names") or [])
-            if initial_events:
-                batch = {
-                    "new_events": initial_events,
-                    "available_event_names": sorted(known_event_names),
-                    "buffer_size": initial.get("buffer_size") or 0,
-                    "captured_at": str(initial.get("captured_at") or ""),
-                }
-                yield f"event: events\ndata: {json.dumps(batch, ensure_ascii=False, default=str)}\n\n"
+            batch = _admin_events_batch_from_recent(initial)
+            yield f"event: events\ndata: {json.dumps(batch, ensure_ascii=False, default=str)}\n\n"
         except Exception as exc:
             yield f"event: upstream_error\ndata: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
             known_event_names = set()
@@ -731,12 +742,19 @@ async def admin_events_stream(
 
                 known_event_names.add(event.event_name)
                 serialized = jsonable_encoder(event)
-                batch = {
+                metadata = await dashboard_service.recent_runtime_events(
+                    target_id=normalized_target_id,
+                    symbol=normalized_symbol,
+                    market_scope=market_scope_filter,
+                    event_name=normalized_event_name,
+                    limit=limit,
+                )
+                batch = _admin_events_batch_from_recent(metadata)
+                batch.update({
                     "new_events": [serialized],
                     "available_event_names": sorted(known_event_names),
-                    "buffer_size": 0,
                     "captured_at": serialized.get("published_at", ""),
-                }
+                })
                 yield f"event: events\ndata: {json.dumps(batch, ensure_ascii=False, default=str)}\n\n"
 
     return StreamingResponse(
